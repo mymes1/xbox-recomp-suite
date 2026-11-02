@@ -9,7 +9,7 @@ on:
         required: false
         default: "game-data"
       game_asset:
-        description: "Release asset: ISO or ZIP containing default.xbe"
+        description: "Release asset (.iso or .zip containing game files/an ISO)"
         required: false
         default: "sonic-heroes.iso"
       game_iso_url:
@@ -21,7 +21,7 @@ on:
         required: false
         default: "75"
       fps_cap:
-        description: "Frame cap: 60, 90, 120 or 0"
+        description: "Frame cap (60, 90, 120 or 0)"
         required: false
         default: "60"
       power_mode:
@@ -48,12 +48,16 @@ permissions:
 
 jobs:
   build:
-    name: Recompile and package APK
+    name: Recompile and package Sonic Heroes ARM64
     runs-on: ubuntu-24.04
     timeout-minutes: 240
 
     steps:
-      - name: Check out repository
+      # -------------------------------------------------------
+      # Checkout and language toolchains
+      # -------------------------------------------------------
+
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -61,19 +65,22 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Set up JDK 17
+      - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      # Use the runner's installed SDK manager.
-      # Do not use setup-android@v3 here: its requested tools download
-      # previously returned HTTP 404.
+      # -------------------------------------------------------
+      # Android SDK
+      # Use the SDK manager already installed on the runner.
+      # Avoid setup-android requesting the unavailable 16.0 ZIP.
+      # -------------------------------------------------------
+
       - name: Install Android SDK and NDK
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
 
           SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
           SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
@@ -84,13 +91,12 @@ jobs:
 
           if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
             echo "::error::Android sdkmanager was not found."
-            echo "ANDROID_SDK_ROOT=$SDK"
             find /usr/local/lib/android -name sdkmanager -type f 2>/dev/null || true
             exit 1
           fi
 
-          echo "Using SDK: $SDK"
-          echo "Using sdkmanager: $SDKMANAGER"
+          echo "SDK: $SDK"
+          echo "SDK manager: $SDKMANAGER"
 
           set +o pipefail
           yes | "$SDKMANAGER" --sdk_root="$SDK" --licenses >/dev/null
@@ -111,19 +117,22 @@ jobs:
           echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
           echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
+          echo "NDK=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
 
           test -d "$SDK/platforms/android-35"
           test -d "$SDK/build-tools/36.0.0"
-          test -d "$SDK/ndk/28.2.13676358"
+          test -f "$SDK/ndk/28.2.13676358/build/cmake/android.toolchain.cmake"
 
-          echo "Android SDK and NDK installation verified."
+          echo "Android SDK and NDK verified."
 
-      # SDL3 is built from source because libsdl3-dev was unavailable
-      # in the previous Ubuntu 24.04 apt install.
-      - name: Install Linux build dependencies
+      # -------------------------------------------------------
+      # Linux dependencies
+      # -------------------------------------------------------
+
+      - name: Install Linux dependencies
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
 
           sudo apt-get update
 
@@ -138,6 +147,7 @@ jobs:
             python3-pip \
             python3-venv \
             git \
+            gh \
             curl \
             wget \
             unzip \
@@ -166,17 +176,27 @@ jobs:
             libudev-dev
 
           command -v 7z
+          command -v gh
           clang++ --version | head -1
           cmake --version | head -1
           ninja --version
+          pkg-config --exists vulkan
+
+      # -------------------------------------------------------
+      # SDL3
+      # Ubuntu 24.04 does not provide the libsdl3-dev package
+      # used by the old workflow.
+      # -------------------------------------------------------
 
       - name: Build and install SDL3
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
 
-          git clone --depth 1 --branch release-3.2.10 \
-            https://github.com/libsdl-org/SDL.git /tmp/SDL3
+          git clone --depth 1 \
+            --branch release-3.2.10 \
+            https://github.com/libsdl-org/SDL.git \
+            /tmp/SDL3
 
           cmake -S /tmp/SDL3 -B /tmp/SDL3/build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -197,9 +217,20 @@ jobs:
           pkg-config --modversion sdl3
 
           echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
-          echo "SDL3 installed successfully."
 
-      - name: Download and extract game files
+      # -------------------------------------------------------
+      # Download and normalize the game input
+      #
+      # Supports:
+      # 1. ZIP containing default.xbe and DVD/
+      # 2. ZIP containing a uniquely named XBE
+      # 3. ZIP containing an ISO/XISO
+      # 4. Direct ISO/XISO download
+      #
+      # It never uploads game files as build artifacts.
+      # -------------------------------------------------------
+
+      - name: Download and prepare game files
         id: game
         shell: bash
         env:
@@ -208,17 +239,19 @@ jobs:
           GAME_ASSET: ${{ inputs.game_asset }}
           GAME_ISO_URL: ${{ inputs.game_iso_url }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
 
           ASSETS="ports/SonicHeroes/assets"
           INPUT="$ASSETS/game-input"
-          EXTRACT="$ASSETS/game-extract"
+          STAGE="$ASSETS/game-extract"
 
           mkdir -p "$ASSETS"
-          rm -rf "$INPUT" "$EXTRACT"
+          rm -rf "$INPUT" "$STAGE"
+
+          echo "=== Downloading game input ==="
 
           if [ -n "${GAME_ISO_URL:-}" ]; then
-            echo "Downloading game archive from supplied URL..."
+            echo "Using supplied download URL."
 
             curl -fL \
               --retry 3 \
@@ -227,117 +260,270 @@ jobs:
               --output "$INPUT" \
               "$GAME_ISO_URL"
           else
-            echo "Downloading $GAME_ASSET from release $RELEASE_TAG..."
+            echo "Release: $RELEASE_TAG"
+            echo "Asset: $GAME_ASSET"
 
-            if ! gh release download "$RELEASE_TAG" \
+            gh release download "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
               --pattern "$GAME_ASSET" \
-              --output "$INPUT"; then
-              echo "::error::Could not download the requested release asset."
-              echo "Check the release tag, asset filename and GAME_DATA_TOKEN permissions."
-              exit 1
-            fi
+              --output "$INPUT"
           fi
 
-          if [ ! -s "$INPUT" ]; then
+          test -s "$INPUT" || {
             echo "::error::Downloaded game file is empty."
             exit 1
-          fi
+          }
 
-          echo "Downloaded file information:"
+          echo "=== Download information ==="
           file "$INPUT"
           ls -lh "$INPUT"
 
-          if file "$INPUT" | grep -qi 'zip archive'; then
+          FILE_INFO="$(file -b "$INPUT")"
+          LOWER_ASSET="${GAME_ASSET,,}"
+
+          # ---------------------------------------------------
+          # ZIP archive
+          # ---------------------------------------------------
+
+          if echo "$FILE_INFO" | grep -qi 'zip archive'; then
+
             echo "ZIP archive detected."
 
-            # Test the complete archive before extracting it.
-            # This catches damaged archives and unsupported encryption.
-            echo "Testing ZIP archive with 7-Zip..."
-
             if ! 7z t "$INPUT"; then
-              echo "::error::7-Zip could not test this archive."
-              echo "The archive may be damaged, encrypted or use an unsupported compression method."
+              echo "::error::The ZIP archive failed its integrity test."
+              echo "It may be damaged, encrypted or use an unsupported codec."
               exit 1
             fi
 
-            mkdir -p "$EXTRACT"
+            mkdir -p "$STAGE"
 
-            echo "Extracting archive with 7-Zip..."
+            7z x "$INPUT" "-o$STAGE" -y
 
-            if ! 7z x "$INPUT" "-o$EXTRACT" -y; then
-              echo "::error::7-Zip extraction failed."
-              exit 1
-            fi
+            echo "=== Searching for XBE ==="
 
-            echo "Searching for default.xbe..."
+            XBE="$(find "$STAGE" -type f -iname 'default.xbe' -print -quit)"
 
-            XBE="$(find "$EXTRACT" -type f -iname 'default.xbe' -print -quit)"
-
+            # If the executable has another name, accept it only
+            # when exactly one XBE exists.
             if [ -z "$XBE" ]; then
-              echo "::error::No default.xbe was found in the extracted archive."
-              echo "Archive contents:"
-              find "$EXTRACT" -maxdepth 4 -type f | head -100
-              exit 1
+              mapfile -t XBES < <(
+                find "$STAGE" -type f -iname '*.xbe' -print | sort
+              )
+
+              if [ "${#XBES[@]}" -eq 1 ]; then
+                XBE="${XBES[0]}"
+                echo "Using the only XBE found: $XBE"
+              elif [ "${#XBES[@]}" -gt 1 ]; then
+                echo "::error::Multiple XBE files found but none is named default.xbe."
+                printf '%s\n' "${XBES[@]}"
+                exit 1
+              fi
             fi
 
-            GAME_DIR="$(dirname "$XBE")"
+            if [ -n "$XBE" ]; then
 
-            echo "Found game executable: $XBE"
-            echo "Copying game directory: $GAME_DIR"
+              echo "Found executable: $XBE"
 
-            cp -a "$GAME_DIR"/. "$ASSETS"/
+              # Copy the complete game folder, not just the XBE.
+              GAME_DIR="$(dirname "$XBE")"
 
-            rm -rf "$EXTRACT"
+              # Prefer the nearest parent containing the DVD folder.
+              SEARCH_DIR="$GAME_DIR"
+
+              while [ "$SEARCH_DIR" != "$STAGE" ]; do
+                if [ -d "$SEARCH_DIR/DVD" ] || [ -d "$SEARCH_DIR/dvd" ]; then
+                  GAME_DIR="$SEARCH_DIR"
+                  break
+                fi
+
+                PARENT="$(dirname "$SEARCH_DIR")"
+
+                if [ "$PARENT" = "$SEARCH_DIR" ]; then
+                  break
+                fi
+
+                SEARCH_DIR="$PARENT"
+              done
+
+              echo "Game directory: $GAME_DIR"
+
+              cp -a "$GAME_DIR"/. "$ASSETS"/
+
+              # Normalize alternate executable names.
+              if [ ! -s "$ASSETS/default.xbe" ]; then
+                cp "$XBE" "$ASSETS/default.xbe"
+              fi
+
+            else
+
+              # -------------------------------------------------
+              # No XBE: look for an ISO inside the ZIP.
+              # -------------------------------------------------
+
+              echo "No XBE found. Searching for nested disc images."
+
+              mapfile -t ISOS < <(
+                find "$STAGE" -type f \
+                  \( -iname '*.iso' -o -iname '*.xiso' -o -iname '*.img' \) \
+                  -print | sort
+              )
+
+              if [ "${#ISOS[@]}" -eq 1 ]; then
+                echo "Found disc image: ${ISOS[0]}"
+                cp "${ISOS[0]}" "$ASSETS/sonic-heroes.iso"
+
+              elif [ "${#ISOS[@]}" -gt 1 ]; then
+                echo "::error::Multiple disc images found. Supply one game image."
+                printf '%s\n' "${ISOS[@]}"
+                exit 1
+
+              else
+                echo "::error::Archive contains neither default.xbe nor an ISO."
+                echo "Archive file listing:"
+                find "$STAGE" -maxdepth 5 -type f | head -200
+                exit 1
+              fi
+            fi
+
+            rm -rf "$STAGE"
             rm -f "$INPUT"
 
-          else
-            echo "Non-ZIP game image detected."
+          # ---------------------------------------------------
+          # Raw ISO/XISO
+          # ---------------------------------------------------
 
+          elif [[ "$LOWER_ASSET" == *.iso ]] || \
+               [[ "$LOWER_ASSET" == *.xiso ]] || \
+               echo "$FILE_INFO" | grep -Eqi 'ISO 9660|XDVDFS'; then
+
+            echo "Disc image detected."
             mv "$INPUT" "$ASSETS/sonic-heroes.iso"
-          fi
 
-          echo "Checking prepared game assets..."
-          find "$ASSETS" -maxdepth 2 -type f | head -100
-
-          if [ ! -f "$ASSETS/default.xbe" ] && \
-             [ ! -f "$ASSETS/sonic-heroes.iso" ]; then
-            echo "::error::Neither default.xbe nor sonic-heroes.iso is present."
+          else
+            echo "::error::Unsupported game input format."
+            echo "File information: $FILE_INFO"
+            echo "Supply a ZIP containing default.xbe/game files or an ISO."
             exit 1
           fi
+
+          # ---------------------------------------------------
+          # Final validation
+          # ---------------------------------------------------
+
+          echo "=== Prepared game files ==="
+
+          if [ -s "$ASSETS/default.xbe" ]; then
+            echo "Ready: assets/default.xbe"
+          elif [ -s "$ASSETS/sonic-heroes.iso" ]; then
+            echo "Ready: assets/sonic-heroes.iso"
+          else
+            echo "::error::No usable XBE or ISO was prepared."
+            find "$ASSETS" -maxdepth 3 -type f | head -150
+            exit 1
+          fi
+
+          echo "=== DVD directory preview ==="
+          find "$ASSETS/DVD" -maxdepth 1 -type f 2>/dev/null | head -30 || true
 
           echo "Game input preparation completed."
 
-      - name: Prepare port and generate recompilation
+      # -------------------------------------------------------
+      # Verify files before running the port build.
+      # -------------------------------------------------------
+
+      - name: Verify game input
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
 
-          python3 tools/prepare.py SonicHeroes
+          ASSETS="ports/SonicHeroes/assets"
 
-          ports/SonicHeroes/build.sh --generate-only
+          echo "=== XBE files ==="
+          find "$ASSETS" -type f -iname '*.xbe' -print || true
 
-      - name: Build Android ARM64 APK
-        shell: bash
-        run: |
-          set -euo pipefail
+          echo "=== ISO files ==="
+          find "$ASSETS" -maxdepth 2 -type f -iname '*.iso' -print || true
 
-          python3 tools/build_android.py SonicHeroes --jobs 4 \
-            --render-percent "${{ inputs.render_percent }}" \
-            --fps-cap "${{ inputs.fps_cap }}" \
-            --power-mode "${{ inputs.power_mode }}" \
-            --resolution-min 50 \
-            --resolution-max 85 \
-            ${{ inputs.dynamic_resolution && '' || '--no-dynamic-resolution' }} \
-            ${{ inputs.precise_pacing && '' || '--no-precise-pacing' }}
-
-          if [ ! -f dist/SonicHeroes-arm64-debug.apk ]; then
-            echo "::error::Build finished without producing the expected APK."
-            echo "APK files found:"
-            find . -type f -name '*.apk' -print
+          if [ ! -s "$ASSETS/default.xbe" ] && \
+             [ ! -s "$ASSETS/sonic-heroes.iso" ]; then
+            echo "::error::Game input verification failed."
             exit 1
           fi
 
-          ls -lh dist/SonicHeroes-arm64-debug.apk
+          echo "Game input passed verification."
+
+      # -------------------------------------------------------
+      # Generate guest code
+      # -------------------------------------------------------
+
+      - name: Prepare port and recompile guest code
+        timeout-minutes: 150
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          set -x
+
+          python3 tools/prepare.py SonicHeroes
+
+          chmod +x ports/SonicHeroes/build.sh
+
+          ports/SonicHeroes/build.sh --generate-only
+
+          test -s ports/SonicHeroes/assets/default.xbe
+          test -s ports/SonicHeroes/generated/game/x86_func_mapping.cpp
+
+          echo "Guest recompilation completed."
+
+      # -------------------------------------------------------
+      # Build Android ARM64 APK
+      # -------------------------------------------------------
+
+      - name: Build Android ARM64 APK
+        timeout-minutes: 150
+        shell: bash
+        env:
+          RENDER_PERCENT: ${{ inputs.render_percent }}
+          FPS_CAP: ${{ inputs.fps_cap }}
+          POWER_MODE: ${{ inputs.power_mode }}
+          DYNAMIC_RESOLUTION: ${{ inputs.dynamic_resolution }}
+          PRECISE_PACING: ${{ inputs.precise_pacing }}
+        run: |
+          set -Eeuo pipefail
+          set -x
+
+          ARGS=(
+            SonicHeroes
+            --jobs 4
+            --render-percent "$RENDER_PERCENT"
+            --fps-cap "$FPS_CAP"
+            --power-mode "$POWER_MODE"
+            --resolution-min 50
+            --resolution-max 85
+          )
+
+          if [ "$DYNAMIC_RESOLUTION" != "true" ]; then
+            ARGS+=(--no-dynamic-resolution)
+          fi
+
+          if [ "$PRECISE_PACING" != "true" ]; then
+            ARGS+=(--no-precise-pacing)
+          fi
+
+          python3 tools/build_android.py "${ARGS[@]}"
+
+          APK="dist/SonicHeroes-arm64-debug.apk"
+
+          if [ ! -s "$APK" ]; then
+            echo "::error::Expected APK was not produced."
+            find dist -maxdepth 2 -type f -name '*.apk' -print || true
+            exit 1
+          fi
+
+          ls -lh "$APK"
+
+      # -------------------------------------------------------
+      # Upload APK
+      # -------------------------------------------------------
 
       - name: Upload installable APK
         uses: actions/upload-artifact@v4
@@ -347,13 +533,19 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      # -------------------------------------------------------
+      # Diagnostics only. Never upload the game files.
+      # -------------------------------------------------------
+
       - name: Upload build diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: SonicHeroes-build-notes
+          name: SonicHeroes-build-diagnostics
           path: |
             ports/SonicHeroes/config/game.toml
             ports/SonicHeroes/PORT_STATUS.md
+            ports/SonicHeroes/out/build/
+            ports/SonicHeroes/generated/game/
           if-no-files-found: warn
-          retention-days: 30
+          retention-days: 7
