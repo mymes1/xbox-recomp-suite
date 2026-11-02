@@ -1,18 +1,6 @@
 
 #!/usr/bin/env bash
-# Sonic Heroes Linux build.
-#
-#   ./build.sh                    Release build
-#   ./build.sh debug              Debug build
-#   ./build.sh --generate-only    Recompile guest code for Android
-#
-# Accepts:
-#   assets/default.xbe
-#   assets/DVD/default.xbe
-#   assets/<any-subfolder>/default.xbe
-#   assets/*.iso
-
-set -euo pipefail
+set -Eeuo pipefail
 
 GAME_TITLE="Sonic Heroes - XBE Recomp"
 GAME_XBE="default.xbe"
@@ -25,73 +13,75 @@ GENERATE_ONLY=0
 
 for arg in "$@"; do
     case "$arg" in
-        debug)
-            PRESET="linux-debug"
-            ;;
-        --generate-only)
-            GENERATE_ONLY=1
-            ;;
-        *)
-            echo "usage: $0 [debug] [--generate-only]"
-            exit 2
-            ;;
+        debug) PRESET="linux-debug" ;;
+        --generate-only) GENERATE_ONLY=1 ;;
+        *) echo "usage: $0 [debug] [--generate-only]"; exit 2 ;;
     esac
 done
 
 OUT="out/build/$PRESET"
 
-echo
-echo "  $GAME_TITLE"
-echo "  =================="
-echo
-
 fail() {
     echo
-    echo "  BUILD FAILED. $*"
-    echo
+    echo "BUILD FAILED: $*"
     exit 1
 }
 
-# Find the game executable anywhere inside assets.
-find_game_xbe() {
-    if [ -s "assets/$GAME_XBE" ]; then
-        printf '%s\n' "assets/$GAME_XBE"
+trap 'rc=$?; echo "::error::build.sh failed at line $LINENO: $BASH_COMMAND (exit $rc)"; exit "$rc"' ERR
+
+echo
+echo "$GAME_TITLE"
+echo "===================="
+
+# Find default.xbe, including nested directories.
+find_default_xbe() {
+    find assets -type f -iname "$GAME_XBE" -print -quit 2>/dev/null || true
+}
+
+# If there is exactly one differently named XBE, use it as a fallback.
+find_alternative_xbe() {
+    mapfile -t candidates < <(
+        find assets -type f -iname '*.xbe' -print 2>/dev/null
+    )
+
+    if [ "${#candidates[@]}" -eq 1 ]; then
+        echo "${candidates[0]}"
         return 0
     fi
 
-    find assets \
-        -type f \
-        -iname "$GAME_XBE" \
-        -not -path "assets/.git/*" \
-        -print 2>/dev/null | sort | head -n 1
+    if [ "${#candidates[@]}" -gt 1 ]; then
+        echo "Multiple XBE files found:" >&2
+        printf '  %s\n' "${candidates[@]}" >&2
+    fi
+
+    return 1
 }
 
-# Place the executable where the recompiler expects it.
-prepare_game_xbe() {
-    local found_xbe
+prepare_xbe() {
+    local found=""
 
-    found_xbe="$(find_game_xbe || true)"
+    found="$(find_default_xbe)"
 
-    if [ -z "$found_xbe" ]; then
+    if [ -z "$found" ]; then
+        found="$(find_alternative_xbe || true)"
+    fi
+
+    if [ -z "$found" ]; then
         return 1
     fi
 
-    if [ "$found_xbe" != "assets/$GAME_XBE" ]; then
-        echo "      found nested executable: $found_xbe"
-        echo "      copying to assets/$GAME_XBE"
-
-        cp "$found_xbe" "assets/$GAME_XBE"
+    if [ "$found" != "assets/$GAME_XBE" ]; then
+        echo "Found executable: $found"
+        cp "$found" "assets/$GAME_XBE"
     fi
 
-    [ -s "assets/$GAME_XBE" ] || return 1
-
-    echo "      executable ready: assets/$GAME_XBE"
-    return 0
+    test -s "assets/$GAME_XBE"
+    echo "Executable ready: assets/$GAME_XBE"
 }
 
-# ----------------------------------------------------------------
-# Toolchain
-# ----------------------------------------------------------------
+# --------------------------------------------------
+# 1. Toolchain
+# --------------------------------------------------
 
 echo "[1/5] Toolchain"
 
@@ -103,187 +93,149 @@ done
 
 if command -v pkg-config >/dev/null 2>&1; then
     pkg-config --exists sdl3 || missing+=("SDL3")
-    pkg-config --exists vulkan || missing+=("Vulkan loader")
+    pkg-config --exists vulkan || missing+=("Vulkan")
 fi
 
 if ((${#missing[@]})); then
-    echo "      missing: ${missing[*]}"
-    echo "      Install the missing build dependencies."
-    fail "Required build tools are unavailable."
+    printf 'Missing tools: %s\n' "${missing[*]}"
+    fail "Install the missing build dependencies."
 fi
 
-echo "      $(clang++ --version | head -n 1)"
+clang++ --version | head -1
 
-# ----------------------------------------------------------------
-# Game files
-# ----------------------------------------------------------------
+# --------------------------------------------------
+# 2. Game files
+# --------------------------------------------------
 
 echo "[2/5] Game files"
 
 mkdir -p assets
 
-# First check for an executable already extracted by GitHub Actions.
-# This is important because the executable may be inside DVD/.
-if ! prepare_game_xbe; then
+if ! prepare_xbe; then
 
-    echo "      No extracted default.xbe found."
+    echo "No XBE found in extracted files."
 
-    # If no XBE exists, look for an ISO.
-    iso="$(find assets -maxdepth 1 -type f -iname '*.iso' -print | sort | head -n 1)"
+    iso="$(find assets -maxdepth 1 -type f -iname '*.iso' -print -quit)"
 
     if [ -z "$iso" ]; then
-        echo "      Files currently inside assets:"
-        find assets -maxdepth 3 -type f | head -100
+        echo
+        echo "=== All XBE files ==="
+        find assets -type f -iname '*.xbe' -print || true
 
-        fail "No default.xbe or ISO found in $(realpath assets)."
+        echo
+        echo "=== Top-level game files ==="
+        find assets -maxdepth 2 -type f -print | head -200
+
+        echo
+        echo "=== DVD directory ==="
+        ls -lah assets/DVD/ 2>/dev/null || true
+
+        fail "No default.xbe or ISO found. The extracted archive may be missing the Xbox executable."
     fi
 
-    size="$(du -h "$iso" | cut -f1)"
+    echo "Extracting ISO: $iso"
 
-    echo "      extracting $(basename "$iso") ($size)"
-    echo "      extraction destination: assets/"
-
-    # Prepare the SDK and extraction tools.
-    python3 ../../tools/prepare.py SonicHeroes >/dev/null \
+    python3 ../../tools/prepare.py SonicHeroes \
         || fail "SDK preparation failed."
 
     cmake --preset "$PRESET" \
-        || fail "CMake could not configure."
+        || fail "CMake configuration failed."
 
-    cmake --build "$PRESET" --target iso_extract \
+    cmake --build --preset "$PRESET" \
+        --target iso_extract \
         -j "$(nproc)" \
-        || fail "iso_extract did not build."
+        || fail "iso_extract compilation failed."
 
-    if [ ! -x "$OUT/iso_extract" ]; then
-        fail "The ISO extraction executable was not created at $OUT/iso_extract."
-    fi
+    test -x "$OUT/iso_extract" \
+        || fail "iso_extract executable was not generated."
 
     "$OUT/iso_extract" --all "$iso" assets \
-        || fail "$(basename "$iso") could not be extracted."
+        || fail "ISO extraction failed."
 
-    # The ISO extractor may place the XBE in DVD/ or another directory.
-    prepare_game_xbe \
+    prepare_xbe \
         || {
-            echo "      Extracted files:"
-            find assets -maxdepth 4 -type f | head -150
-            fail "The extracted ISO contains no usable $GAME_XBE."
+            echo "Extracted files:"
+            find assets -maxdepth 4 -type f | head -200
+            fail "ISO extraction completed but no XBE was found."
         }
 fi
 
-# ----------------------------------------------------------------
-# Recompiler configuration
-# ----------------------------------------------------------------
+# --------------------------------------------------
+# 3. Recompiler configuration
+# --------------------------------------------------
 
 echo "[3/5] Recompiler config"
 
 python3 ../../tools/prepare.py SonicHeroes \
     || fail "SDK preparation failed."
 
-[ -s "assets/$GAME_XBE" ] \
-    || fail "The game executable is missing or empty."
+test -s "assets/$GAME_XBE" \
+    || fail "Missing executable."
 
-if [ ! -f config/game.toml ] || {
-    grep -q '^entry = 0x10000$' config/game.toml &&
-    ! grep -A2 '^\[symbols\]' config/game.toml | grep -q '='
-}; then
-    python3 ../../tools/sonic_heroes.py "assets/$GAME_XBE" \
-        || fail "Could not read the XBE header."
-else
-    echo "      config/game.toml already written for this executable"
-fi
+python3 ../../tools/sonic_heroes.py "assets/$GAME_XBE" \
+    || fail "XBE header parsing failed."
 
-# Try to identify library symbols when signatures are available.
 if ! grep -A2 '^\[symbols\]' config/game.toml | grep -q '='; then
 
     cmake --preset "$PRESET" \
-        || fail "CMake could not configure."
+        || fail "CMake configuration failed."
 
-    cmake --build "$PRESET" --target xbe_symbols \
+    cmake --build --preset "$PRESET" \
+        --target xbe_symbols \
         -j "$(nproc)" \
-        || fail "xbe_symbols did not build."
+        || fail "xbe_symbols compilation failed."
 
     if [ -f "$OUT/xbe_symbols" ]; then
-
         SDK="$(head -n 1 "$OUT/sdk_dir.txt")"
 
-        echo "      trying xbe_symbols for $GAME_XBE"
-
         if "$OUT/xbe_symbols" \
-            "assets/$GAME_XBE" \
-            "$SDK/xdk" \
+            "assets/$GAME_XBE" "$SDK/xdk" \
             --out config/game.toml; then
-
-            echo "      symbols written"
-
+            echo "Symbol generation completed."
         else
-            echo "      no checked-in signatures for this XDK build."
-            echo "      continuing with generated config."
+            echo "No matching XDK signatures found."
         fi
     fi
 fi
 
 cmake --preset "$PRESET" \
-    || fail "CMake could not configure."
+    || fail "Final CMake configuration failed."
 
-# Check unresolved ABI argument locations.
 if grep -n '^[A-Za-z_0-9]* *= *\[.*"?"' config/game.toml; then
-    echo
-    echo "      Unresolved [abi] argument locations detected."
-    echo "      Fill these in according to the API comments."
-    fail "The generated ABI configuration is incomplete."
+    fail "Unresolved ABI argument locations need manual correction."
 fi
 
-# ----------------------------------------------------------------
-# Game code
-# ----------------------------------------------------------------
+# --------------------------------------------------
+# 4. Game code
+# --------------------------------------------------
 
 echo "[4/5] Game code"
 
 if [ "$GENERATE_ONLY" = 1 ]; then
 
-    echo "      recompiling $GAME_XBE (guest code only)"
-
-    cmake --build "$PRESET" \
+    cmake --build --preset "$PRESET" \
         --target recompile_SonicHeroes \
         -j "$(nproc)" \
-        || fail "The guest-code recompiler failed."
+        || fail "Guest code recompilation failed."
 
-    echo
-    echo "  Guest code generation completed."
-    echo "  Next: python3 tools/build_android.py SonicHeroes"
-    echo
-
+    echo "Guest code generation completed."
     exit 0
 fi
 
-echo "      compiling $GAME_XBE"
-
-cmake --build "$PRESET" \
+cmake --build --preset "$PRESET" \
     --target SonicHeroes \
     -j "$(nproc)" \
-    || fail "The Sonic Heroes build failed."
+    || fail "Sonic Heroes compilation failed."
 
-# ----------------------------------------------------------------
-# Tests
-# ----------------------------------------------------------------
+# --------------------------------------------------
+# 5. Tests
+# --------------------------------------------------
 
 echo "[5/5] Tests"
 
 ctest --preset "$PRESET" --output-on-failure \
-    || echo "      WARNING: Some tests failed."
+    || echo "WARNING: Some tests failed."
 
 echo
-echo "  $GAME_TITLE built."
-echo "  $OUT/$GAME_EXE"
-echo
-
-if [ -t 0 ] && [ -z "${CI:-}" ]; then
-    read -r -p "  Play now? [y/N] " answer
-
-    if [[ "$answer" =~ ^[Yy] ]]; then
-        cd "$OUT"
-        exec "./$GAME_EXE"
-    fi
-fi
-
-exit 0
+echo "Build completed."
+echo "$OUT/$GAME_EXE"
