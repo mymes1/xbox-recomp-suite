@@ -1,27 +1,27 @@
 
-name: Sonic Heroes Android ARM64
+name: Sonic Heroes Android
 
 on:
   workflow_dispatch:
     inputs:
       game_release_tag:
-        description: "Release containing game data"
+        description: "Release tag containing your game archive"
         required: false
         default: "game-data"
       game_asset:
-        description: "ISO or ZIP containing default.xbe"
+        description: "Release asset: ISO or ZIP containing default.xbe"
         required: false
         default: "sonic-heroes.iso"
       game_iso_url:
-        description: "Optional direct ISO URL"
+        description: "Optional direct download URL (overrides release asset)"
         required: false
         default: ""
       render_percent:
-        description: "Render scale (50-100)"
+        description: "Initial render scale (50-100)"
         required: false
         default: "75"
       fps_cap:
-        description: "FPS cap: 60, 90, 120 or 0"
+        description: "Frame cap: 60, 90, 120 or 0"
         required: false
         default: "60"
       power_mode:
@@ -48,36 +48,29 @@ permissions:
 
 jobs:
   build:
-    name: Sonic Heroes Android Build
+    name: Recompile and package APK
     runs-on: ubuntu-24.04
     timeout-minutes: 240
 
     steps:
-      # CHECKOUT
-
-      - name: Checkout repository
+      - name: Check out repository
         uses: actions/checkout@v4
 
-      # PYTHON
-
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      # JAVA
-
-      - name: Setup Java
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      # ANDROID SDK
-      # Use preinstalled command-line tools.
-      # Do not request version 16.0 from setup-android.
-
-      - name: Configure Android SDK
+      # Use the runner's installed SDK manager.
+      # Do not use setup-android@v3 here: its requested tools download
+      # previously returned HTTP 404.
+      - name: Install Android SDK and NDK
         shell: bash
         run: |
           set -euo pipefail
@@ -86,25 +79,27 @@ jobs:
           SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
 
           if [ ! -x "$SDKMANAGER" ]; then
-            echo "::error::sdkmanager not found"
-            find "$SDK/cmdline-tools" -name sdkmanager -type f
+            SDKMANAGER="$(command -v sdkmanager || true)"
+          fi
+
+          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "::error::Android sdkmanager was not found."
+            echo "ANDROID_SDK_ROOT=$SDK"
+            find /usr/local/lib/android -name sdkmanager -type f 2>/dev/null || true
             exit 1
           fi
 
-          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-
-          echo "SDK: $SDK"
-          "$SDKMANAGER" --version
+          echo "Using SDK: $SDK"
+          echo "Using sdkmanager: $SDKMANAGER"
 
           set +o pipefail
-          yes | "$SDKMANAGER" --sdk_root="$SDK" --licenses
+          yes | "$SDKMANAGER" --sdk_root="$SDK" --licenses >/dev/null
           LICENSE_STATUS=${PIPESTATUS[1]}
           set -o pipefail
 
           if [ "$LICENSE_STATUS" -ne 0 ]; then
-            echo "::error::Android SDK license acceptance failed"
-            exit 1
+            echo "::error::Android SDK license acceptance failed."
+            exit "$LICENSE_STATUS"
           fi
 
           "$SDKMANAGER" --sdk_root="$SDK" \
@@ -113,14 +108,18 @@ jobs:
             "build-tools;36.0.0" \
             "ndk;28.2.13676358"
 
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
+
           test -d "$SDK/platforms/android-35"
           test -d "$SDK/build-tools/36.0.0"
           test -d "$SDK/ndk/28.2.13676358"
 
-          echo "Android SDK ready"
+          echo "Android SDK and NDK installation verified."
 
-      # LINUX DEPENDENCIES
-
+      # SDL3 is built from source because libsdl3-dev was unavailable
+      # in the previous Ubuntu 24.04 apt install.
       - name: Install Linux build dependencies
         shell: bash
         run: |
@@ -145,6 +144,7 @@ jobs:
             zip \
             file \
             ca-certificates \
+            p7zip-full \
             libvulkan-dev \
             libasound2-dev \
             libpulse-dev \
@@ -165,228 +165,181 @@ jobs:
             libibus-1.0-dev \
             libudev-dev
 
-          echo "Checking SDL3"
-
-          if ! pkg-config --exists sdl3; then
-
-            echo "SDL3 APT package unavailable."
-            echo "Building SDL3 from official source."
-
-            git clone \
-              --depth 1 \
-              --branch release-3.2.10 \
-              https://github.com/libsdl-org/SDL.git \
-              /tmp/SDL3
-
-            cmake -S /tmp/SDL3 \
-              -B /tmp/SDL3/build \
-              -G Ninja \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_INSTALL_PREFIX=/usr/local \
-              -DCMAKE_INSTALL_LIBDIR=lib \
-              -DSDL_SHARED=ON \
-              -DSDL_STATIC=ON \
-              -DSDL_TESTS=OFF \
-              -DSDL_TEST_LIBRARY=OFF
-
-            cmake --build /tmp/SDL3/build --parallel 4
-
-            sudo cmake --install /tmp/SDL3/build
-            sudo ldconfig
-
-          fi
-
-          echo "Checking compiler"
-
-          clang --version
-          clang++ --version
-          cmake --version
+          command -v 7z
+          clang++ --version | head -1
+          cmake --version | head -1
           ninja --version
 
-          echo "Checking SDL3"
+      - name: Build and install SDL3
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/lib/x86_64-linux-gnu/pkgconfig:${PKG_CONFIG_PATH:-}"
+          git clone --depth 1 --branch release-3.2.10 \
+            https://github.com/libsdl-org/SDL.git /tmp/SDL3
+
+          cmake -S /tmp/SDL3 -B /tmp/SDL3/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DSDL_SHARED=ON \
+            -DSDL_STATIC=ON \
+            -DSDL_TESTS=OFF \
+            -DSDL_TEST_LIBRARY=OFF
+
+          cmake --build /tmp/SDL3/build --parallel 4
+
+          sudo cmake --install /tmp/SDL3/build
+          sudo ldconfig
+
+          export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
 
           pkg-config --modversion sdl3
-          pkg-config --cflags --libs sdl3
 
           echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
+          echo "SDL3 installed successfully."
 
-          echo "Linux dependencies ready"
-
-      # GAME DATA
-
-      - name: Download Sonic Heroes game
+      - name: Download and extract game files
+        id: game
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GAME_DATA_TOKEN || github.token }}
           RELEASE_TAG: ${{ inputs.game_release_tag }}
           GAME_ASSET: ${{ inputs.game_asset }}
           GAME_ISO_URL: ${{ inputs.game_iso_url }}
-        shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p ports/SonicHeroes/assets
+          ASSETS="ports/SonicHeroes/assets"
+          INPUT="$ASSETS/game-input"
+          EXTRACT="$ASSETS/game-extract"
 
-          INPUT="ports/SonicHeroes/assets/game-input"
+          mkdir -p "$ASSETS"
+          rm -rf "$INPUT" "$EXTRACT"
 
-          if [ -n "$GAME_ISO_URL" ]; then
-
-            echo "Downloading supplied game URL"
+          if [ -n "${GAME_ISO_URL:-}" ]; then
+            echo "Downloading game archive from supplied URL..."
 
             curl -fL \
               --retry 3 \
               --retry-all-errors \
               --connect-timeout 30 \
-              -o "$INPUT" \
+              --output "$INPUT" \
               "$GAME_ISO_URL"
-
           else
+            echo "Downloading $GAME_ASSET from release $RELEASE_TAG..."
 
-            echo "Downloading release asset"
-
-            gh release download "$RELEASE_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
+            if ! gh release download "$RELEASE_TAG" \
               --pattern "$GAME_ASSET" \
-              --output "$INPUT"
-
+              --output "$INPUT"; then
+              echo "::error::Could not download the requested release asset."
+              echo "Check the release tag, asset filename and GAME_DATA_TOKEN permissions."
+              exit 1
+            fi
           fi
 
-          test -s "$INPUT"
+          if [ ! -s "$INPUT" ]; then
+            echo "::error::Downloaded game file is empty."
+            exit 1
+          fi
 
+          echo "Downloaded file information:"
           file "$INPUT"
           ls -lh "$INPUT"
 
           if file "$INPUT" | grep -qi 'zip archive'; then
+            echo "ZIP archive detected."
 
-            echo "Extracting ZIP"
+            # Test the complete archive before extracting it.
+            # This catches damaged archives and unsupported encryption.
+            echo "Testing ZIP archive with 7-Zip..."
 
-            mkdir -p ports/SonicHeroes/assets/game-extract
-
-            unzip -q "$INPUT" \
-              -d ports/SonicHeroes/assets/game-extract
-
-            XBE=$(find ports/SonicHeroes/assets/game-extract \
-              -type f -iname default.xbe -print -quit)
-
-            if [ -z "$XBE" ]; then
-              echo "::error::default.xbe not found"
+            if ! 7z t "$INPUT"; then
+              echo "::error::7-Zip could not test this archive."
+              echo "The archive may be damaged, encrypted or use an unsupported compression method."
               exit 1
             fi
 
-            GAME_DIR=$(dirname "$XBE")
+            mkdir -p "$EXTRACT"
 
-            cp -a "$GAME_DIR"/. ports/SonicHeroes/assets/
+            echo "Extracting archive with 7-Zip..."
 
-            rm -rf ports/SonicHeroes/assets/game-extract
+            if ! 7z x "$INPUT" "-o$EXTRACT" -y; then
+              echo "::error::7-Zip extraction failed."
+              exit 1
+            fi
+
+            echo "Searching for default.xbe..."
+
+            XBE="$(find "$EXTRACT" -type f -iname 'default.xbe' -print -quit)"
+
+            if [ -z "$XBE" ]; then
+              echo "::error::No default.xbe was found in the extracted archive."
+              echo "Archive contents:"
+              find "$EXTRACT" -maxdepth 4 -type f | head -100
+              exit 1
+            fi
+
+            GAME_DIR="$(dirname "$XBE")"
+
+            echo "Found game executable: $XBE"
+            echo "Copying game directory: $GAME_DIR"
+
+            cp -a "$GAME_DIR"/. "$ASSETS"/
+
+            rm -rf "$EXTRACT"
             rm -f "$INPUT"
 
           else
+            echo "Non-ZIP game image detected."
 
-            mv "$INPUT" \
-              ports/SonicHeroes/assets/sonic-heroes.iso
-
+            mv "$INPUT" "$ASSETS/sonic-heroes.iso"
           fi
 
-          echo "Game assets:"
-          ls -lah ports/SonicHeroes/assets
+          echo "Checking prepared game assets..."
+          find "$ASSETS" -maxdepth 2 -type f | head -100
 
-      # PROJECT VALIDATION
+          if [ ! -f "$ASSETS/default.xbe" ] && \
+             [ ! -f "$ASSETS/sonic-heroes.iso" ]; then
+            echo "::error::Neither default.xbe nor sonic-heroes.iso is present."
+            exit 1
+          fi
 
-      - name: Validate project files
-        shell: bash
-        run: |
-          set -euo pipefail
+          echo "Game input preparation completed."
 
-          test -f tools/prepare.py
-          test -f tools/build_android.py
-          test -f ports/SonicHeroes/build.sh
-
-          echo "Project files found"
-
-          python3 --version
-
-      # PREPARE
-
-      - name: Prepare Sonic Heroes
+      - name: Prepare port and generate recompilation
         shell: bash
         run: |
           set -euo pipefail
 
           python3 tools/prepare.py SonicHeroes
 
-      # GENERATE
-
-      - name: Generate recompilation source
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          chmod +x ports/SonicHeroes/build.sh
-
           ports/SonicHeroes/build.sh --generate-only
 
-      # BUILD APK
-
       - name: Build Android ARM64 APK
-        env:
-          RENDER_PERCENT: ${{ inputs.render_percent }}
-          FPS_CAP: ${{ inputs.fps_cap }}
-          POWER_MODE: ${{ inputs.power_mode }}
-          DYNAMIC_RESOLUTION: ${{ inputs.dynamic_resolution }}
-          PRECISE_PACING: ${{ inputs.precise_pacing }}
         shell: bash
         run: |
           set -euo pipefail
 
-          ARGS=(
-            SonicHeroes
-            --jobs 4
-            --render-percent "$RENDER_PERCENT"
-            --fps-cap "$FPS_CAP"
-            --power-mode "$POWER_MODE"
-            --resolution-min 50
-            --resolution-max 85
-          )
+          python3 tools/build_android.py SonicHeroes --jobs 4 \
+            --render-percent "${{ inputs.render_percent }}" \
+            --fps-cap "${{ inputs.fps_cap }}" \
+            --power-mode "${{ inputs.power_mode }}" \
+            --resolution-min 50 \
+            --resolution-max 85 \
+            ${{ inputs.dynamic_resolution && '' || '--no-dynamic-resolution' }} \
+            ${{ inputs.precise_pacing && '' || '--no-precise-pacing' }}
 
-          if [ "$DYNAMIC_RESOLUTION" != "true" ]; then
-            ARGS+=(--no-dynamic-resolution)
-          fi
-
-          if [ "$PRECISE_PACING" != "true" ]; then
-            ARGS+=(--no-precise-pacing)
-          fi
-
-          echo "Building Sonic Heroes Android ARM64"
-
-          python3 tools/build_android.py "${ARGS[@]}"
-
-          echo "Build command completed"
-
-      # APK VALIDATION
-
-      - name: Verify APK
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          APK="dist/SonicHeroes-arm64-debug.apk"
-
-          if [ ! -s "$APK" ]; then
-            echo "::error::APK not found"
-
-            find dist -maxdepth 4 -type f -print 2>/dev/null || true
-
+          if [ ! -f dist/SonicHeroes-arm64-debug.apk ]; then
+            echo "::error::Build finished without producing the expected APK."
+            echo "APK files found:"
+            find . -type f -name '*.apk' -print
             exit 1
           fi
 
-          echo "APK generated:"
-          ls -lh "$APK"
-          file "$APK"
+          ls -lh dist/SonicHeroes-arm64-debug.apk
 
-      # UPLOAD
-
-      - name: Upload Sonic Heroes APK
+      - name: Upload installable APK
         uses: actions/upload-artifact@v4
         with:
           name: SonicHeroes-arm64-debug
@@ -394,13 +347,11 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # DIAGNOSTICS
-
       - name: Upload build diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: SonicHeroes-build-diagnostics
+          name: SonicHeroes-build-notes
           path: |
             ports/SonicHeroes/config/game.toml
             ports/SonicHeroes/PORT_STATUS.md
