@@ -1,10 +1,11 @@
+
 name: Sonic Heroes Android ARM64
 
 on:
   workflow_dispatch:
     inputs:
       game_release_tag:
-        description: "Release tag containing the game asset"
+        description: "Release tag containing game data"
         required: false
         default: "game-data"
       game_asset:
@@ -12,11 +13,11 @@ on:
         required: false
         default: "sonic-heroes.iso"
       game_iso_url:
-        description: "Optional direct download URL (overrides release asset)"
+        description: "Optional direct ISO download URL"
         required: false
         default: ""
       render_percent:
-        description: "Initial render scale (50-100)"
+        description: "Render scale (50-100)"
         required: false
         default: "75"
       fps_cap:
@@ -47,64 +48,63 @@ permissions:
 
 jobs:
   build:
-    name: Recompile Sonic Heroes for Android
+    name: Recompile and package Sonic Heroes
     runs-on: ubuntu-24.04
     timeout-minutes: 240
 
     steps:
+      # 1. CHECKOUT
+
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      # 2. PYTHON
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
 
-      - name: Setup Java
+      # 3. JAVA
+
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      # ANDROID SDK
+      # 4. ANDROID SDK
+      # Do NOT use android-actions/setup-android here.
+      # The hosted runner already has command-line tools 12.0.
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          cmdline-tools-version: "16.0"
-          accept-android-sdk-licenses: true
-
-      - name: Install Android SDK and NDK
+      - name: Configure Android SDK
         shell: bash
         run: |
           set -euo pipefail
 
-          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
 
-          if [ -z "$SDK" ]; then
-            echo "::error::Android SDK environment variable is missing"
+          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+
+          if [ ! -x "$SDKMANAGER" ]; then
+            echo "::error::Preinstalled sdkmanager not found"
+            find "$SDK/cmdline-tools" -maxdepth 4 -type f \
+              -name sdkmanager || true
             exit 1
           fi
 
-          echo "SDK location: $SDK"
+          export ANDROID_SDK_ROOT="$SDK"
+          export ANDROID_HOME="$SDK"
 
-          mapfile -t MANAGERS < <(
-            find "$SDK/cmdline-tools" \
-              -maxdepth 3 -type f \
-              -name sdkmanager 2>/dev/null
-          )
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
 
-          if [ "${#MANAGERS[@]}" -eq 0 ]; then
-            echo "::error::Cannot find sdkmanager"
-            find "$SDK/cmdline-tools" -maxdepth 4 -print
-            exit 1
-          fi
+          echo "Using Android SDK:"
+          echo "$SDK"
 
-          SDKMANAGER="${MANAGERS[0]}"
-
-          echo "Using: $SDKMANAGER"
           "$SDKMANAGER" --version
+
+          echo "Accepting SDK licenses"
 
           set +o pipefail
           yes | "$SDKMANAGER" --sdk_root="$SDK" --licenses
@@ -112,9 +112,11 @@ jobs:
           set -o pipefail
 
           if [ "$LICENSE_STATUS" -ne 0 ]; then
-            echo "::error::Android SDK license acceptance failed"
+            echo "::error::SDK license acceptance failed"
             exit 1
           fi
+
+          echo "Installing Android packages"
 
           "$SDKMANAGER" --sdk_root="$SDK" \
             "platform-tools" \
@@ -122,13 +124,17 @@ jobs:
             "build-tools;36.0.0" \
             "ndk;28.2.13676358"
 
-          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "Checking installed packages"
 
-          echo "Installed SDK packages:"
           "$SDKMANAGER" --sdk_root="$SDK" --list_installed
 
-      # LINUX BUILD DEPENDENCIES
+          test -d "$SDK/platforms/android-35"
+          test -d "$SDK/build-tools/36.0.0"
+          test -d "$SDK/ndk/28.2.13676358"
+
+          echo "Android SDK is ready"
+
+      # 5. LINUX DEPENDENCIES
 
       - name: Install Linux build dependencies
         shell: bash
@@ -155,42 +161,9 @@ jobs:
             file \
             ca-certificates \
             libvulkan-dev \
-            libwayland-dev \
-            libxkbcommon-dev \
-            libx11-dev \
-            libxext-dev \
-            libxrandr-dev \
-            libxcursor-dev \
-            libxi-dev \
-            libxfixes-dev \
-            libgl1-mesa-dev
+            libsdl3-dev
 
-          # Use the packaged SDL3 development library if available.
-          # Otherwise build SDL3 instead of silently using SDL2.
-
-          if sudo apt-get install -y libsdl3-dev; then
-            echo "Using Ubuntu SDL3 package"
-          else
-            echo "Building SDL3 from source"
-
-            git clone \
-              --depth 1 \
-              --branch release-3.2.10 \
-              https://github.com/libsdl-org/SDL.git \
-              /tmp/SDL3
-
-            cmake -S /tmp/SDL3 -B /tmp/SDL3/build -G Ninja \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_INSTALL_PREFIX=/usr/local \
-              -DSDL_SHARED=ON \
-              -DSDL_STATIC=OFF \
-              -DSDL_TESTS=OFF \
-              -DSDL_TEST_LIBRARY=OFF
-
-            cmake --build /tmp/SDL3/build --parallel 4
-            sudo cmake --install /tmp/SDL3/build
-            sudo ldconfig
-          fi
+          echo "Checking build tools"
 
           clang --version
           clang++ --version
@@ -198,9 +171,9 @@ jobs:
           ninja --version
           pkg-config --modversion sdl3
 
-      # FETCH GAME DATA
+      # 6. FETCH GAME
 
-      - name: Download Sonic Heroes game image
+      - name: Download Sonic Heroes game data
         env:
           GH_TOKEN: ${{ secrets.GAME_DATA_TOKEN || github.token }}
           RELEASE_TAG: ${{ inputs.game_release_tag }}
@@ -215,34 +188,35 @@ jobs:
           INPUT="ports/SonicHeroes/assets/game-input"
 
           if [ -n "$GAME_ISO_URL" ]; then
-            echo "Downloading supplied game URL"
+
+            echo "Downloading supplied ISO URL"
 
             curl -fL \
               --retry 3 \
               --retry-all-errors \
               --connect-timeout 30 \
-              --output "$INPUT" \
+              -o "$INPUT" \
               "$GAME_ISO_URL"
+
           else
-            echo "Downloading release asset: $GAME_ASSET"
+
+            echo "Downloading release asset"
 
             gh release download "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --pattern "$GAME_ASSET" \
               --output "$INPUT"
+
           fi
 
-          if [ ! -s "$INPUT" ]; then
-            echo "::error::Downloaded game image is missing or empty"
-            exit 1
-          fi
+          test -s "$INPUT"
 
           file "$INPUT"
           ls -lh "$INPUT"
 
           if file "$INPUT" | grep -qi 'zip archive'; then
 
-            echo "Extracting game archive"
+            echo "Extracting game ZIP"
 
             mkdir -p ports/SonicHeroes/assets/game-extract
 
@@ -253,7 +227,7 @@ jobs:
               -type f -iname default.xbe -print -quit)
 
             if [ -z "$XBE" ]; then
-              echo "::error::No default.xbe found in ZIP"
+              echo "::error::default.xbe not found"
               exit 1
             fi
 
@@ -271,12 +245,12 @@ jobs:
 
           fi
 
-          echo "Game data prepared:"
+          echo "Game assets:"
           ls -lah ports/SonicHeroes/assets
 
-      # PREPARE RECOMPILATION
+      # 7. VALIDATE REPOSITORY
 
-      - name: Validate build tools and game data
+      - name: Validate project
         shell: bash
         run: |
           set -euo pipefail
@@ -285,30 +259,22 @@ jobs:
           test -f tools/build_android.py
           test -f ports/SonicHeroes/build.sh
 
+          echo "Project files verified"
+
           python3 --version
 
-          echo "Checking game input"
+      # 8. PREPARE PORT
 
-          if [ ! -f ports/SonicHeroes/assets/sonic-heroes.iso ] && \
-             [ ! -f ports/SonicHeroes/assets/default.xbe ]; then
-
-            XBE=$(find ports/SonicHeroes/assets \
-              -type f -iname default.xbe -print -quit)
-
-            if [ -z "$XBE" ]; then
-              echo "::error::No supported game input found"
-              exit 1
-            fi
-          fi
-
-      - name: Prepare Sonic Heroes port
+      - name: Prepare Sonic Heroes
         shell: bash
         run: |
           set -euo pipefail
 
           python3 tools/prepare.py SonicHeroes
 
-      - name: Generate recompilation source
+      # 9. GENERATE RECOMPILATION CODE
+
+      - name: Generate guest recompilation
         shell: bash
         run: |
           set -euo pipefail
@@ -317,7 +283,7 @@ jobs:
 
           ports/SonicHeroes/build.sh --generate-only
 
-      # ANDROID ARM64 COMPILATION
+      # 10. BUILD ANDROID APK
 
       - name: Build Android ARM64 APK
         env:
@@ -348,15 +314,15 @@ jobs:
             ARGS+=(--no-precise-pacing)
           fi
 
-          echo "Starting Android ARM64 compilation"
+          echo "Starting ARM64 Android compilation"
 
           python3 tools/build_android.py "${ARGS[@]}"
 
-          echo "APK build command completed"
+          echo "Compilation finished"
 
-      # VALIDATE OUTPUT
+      # 11. VERIFY APK
 
-      - name: Verify APK
+      - name: Verify generated APK
         shell: bash
         run: |
           set -euo pipefail
@@ -364,28 +330,29 @@ jobs:
           APK="dist/SonicHeroes-arm64-debug.apk"
 
           if [ ! -s "$APK" ]; then
-            echo "::error::Expected APK was not generated"
-            echo "Available output files:"
-            find dist -maxdepth 3 -type f -print 2>/dev/null || true
+            echo "::error::APK was not generated at expected location"
+
+            find dist -maxdepth 4 -type f -print 2>/dev/null || true
+
             exit 1
           fi
 
-          echo "APK successfully generated"
+          echo "APK generated successfully"
+
           ls -lh "$APK"
+          file "$APK"
 
-          if command -v aapt >/dev/null 2>&1; then
-            aapt dump badging "$APK" | head -20
-          fi
+      # 12. UPLOAD APK
 
-      # UPLOAD APK
-
-      - name: Upload Sonic Heroes Android APK
+      - name: Upload Sonic Heroes ARM64 APK
         uses: actions/upload-artifact@v4
         with:
           name: SonicHeroes-arm64-debug
           path: dist/SonicHeroes-arm64-debug.apk
           if-no-files-found: error
           retention-days: 30
+
+      # 13. BUILD DIAGNOSTICS
 
       - name: Upload build diagnostics
         if: always()
