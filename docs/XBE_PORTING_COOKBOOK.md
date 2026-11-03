@@ -18,7 +18,11 @@ The goal for each title is a reproducible local build from the owner's game file
 
 ## XDK builds with no SDK signatures
 
-`xbe_symbols` stops with "no signatures for these library builds" when `xdk/<build>/signatures.toml` is missing. This snapshot has a 5849 signature set and layouts for 5849 plus partial 4721/4531 layouts. Use this order:
+`xbe_symbols` stops with "no signatures for these library builds" when `xdk/<build>/signatures.toml` is missing. This snapshot has a 5849 signature set and layouts for 5849 plus partial 4721/4531 layouts.
+
+An unmatched build is not a build failure: the recompiler adds every name its selected `xdk/<build>/signatures.toml` knows to `[symbols]`/`[data]` with address 0, and names the shared runtime uses that no signature set has carry their own fallback. `image_symbols.h` therefore defines `SYM_`/`HAS_` for all of them, the host links, and the first call to an unresolved name stops with "not in this image" or "... is unknown for this image, add it to the config". Add proven addresses to `config/game.toml`; a build script that regenerates the config from the XBE should keep those tables, as `ports/SonicHeroes/build.sh` does.
+
+Use this order:
 
 1. **Owned titles first.** Run `xbe_symbols` without `--out` on each owned `default.xbe` to read its library builds. Only a complete config for the same build can produce signatures; do not reuse another build's layout.
 2. **Public sources.** Searched on GitHub for 4531 data and found none: upstream `TGP482/XboxXBE-Recomp`, the `Maslin0/XboxXBERecomp` fork (`dsteal`), `crazyriddler/FinestHourRemastered`, `TGP482/SCDA-XBERecomp`, `abilliontokens/urbz-recomp`, `parkerallan/doa3-recomp`, `gamboozino/ngbrecomp` and `nworkers/reJSRF` all ship only 5849 or none. `PatrickvL/DxbxOlderSvnImport` has 4531 XBE dumps but no signature or layout data. Re-check before relying on this list. Also search by title: the games in the Dxbx dumps on 1.0.4531 (Silent Hill 2, Morrowind, Enclave, Hitman 2: Silent Assassin, Crazy Taxi 3, Conflict: Desert Storm) have no Xbox recomp port on GitHub, only PC mods. Other Xbox recomp projects (`nemonicicon/ts3FPrecomp`, `Maslin0/DoubleSteal-XBERecomp`, `AsukaNeo/Exonerated`, `FridiNaTor1/FullSpectrumWarriorTHXBOX`) use XbSymbolDatabase for their XDK addresses and have no 4531 layout.

@@ -175,7 +175,16 @@ test -s "assets/$GAME_XBE" \
 python3 ../../tools/sonic_heroes.py "assets/$GAME_XBE" \
     || fail "XBE header parsing failed."
 
-if ! grep -A2 '^\[symbols\]' config/game.toml | grep -q '='; then
+# A [symbols] entry is a name and its address; comments alone are an empty table.
+has_symbols() {
+    awk '
+        /^\[/ { inside = ($0 == "[symbols]"); next }
+        inside && /^[[:space:]]*[A-Za-z_][A-Za-z_0-9]*[[:space:]]*=/ { found = 1 }
+        END { exit !found }
+    ' config/game.toml
+}
+
+if ! has_symbols; then
 
     cmake --preset "$PRESET" \
         || fail "CMake configuration failed."
@@ -193,8 +202,21 @@ if ! grep -A2 '^\[symbols\]' config/game.toml | grep -q '='; then
             --out config/game.toml; then
             echo "Symbol generation completed."
         else
-            echo "No matching XDK signatures found."
+            echo
+            echo "No signature set for this XBE's XDK library build."
+            echo "The guest code still recompiles and the APK still builds: every XDK"
+            echo "function and data address the host replaces is left 0, which becomes a"
+            echo "trapping stub, so the game stops with \"not in this image\" or"
+            echo "\"is unknown for this image, add it to the config\" on the first call it"
+            echo "needs. Fill in config/game.toml [symbols] and [data] to go further:"
+            echo "  - import addresses from XbSymbolDatabase (docs/XBE_PORTING_COOKBOOK.md),"
+            echo "  - or add them by hand, and they survive the next run of this script."
+            echo
+            echo "::warning title=No XDK signatures for this XBE::config/game.toml [symbols] is empty, so the APK traps on every host XDK call until the addresses are filled in."
         fi
+    else
+        echo
+        echo "::warning title=xbe_symbols was not built::config/game.toml [symbols] stays empty, so the APK traps on every host XDK call until the addresses are filled in."
     fi
 fi
 

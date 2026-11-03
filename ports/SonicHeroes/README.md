@@ -22,6 +22,9 @@ adb install -r dist/SonicHeroes-arm64-debug.apk
 `tools/sonic_heroes.py`, tries `xbe_symbols` when your image's XDK build has
 checked-in signatures, then recompiles. The checked-in `config/game.toml` is a
 template with a placeholder entry point; do not build it without regenerating.
+A rebuild keeps the `[functions]`, `[symbols]`, `[data]` and `[abi]` tables you
+filled in, and prints a warning when `[symbols]` is still empty (the APK then
+builds, but every host XDK call traps until the addresses are supplied).
 
 ## Controls
 

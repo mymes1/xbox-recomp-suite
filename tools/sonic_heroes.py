@@ -16,11 +16,16 @@ checked-in XDK signatures, run ``xbe_symbols`` afterwards to fill in the
 still a valid starting point; identify the missing symbols from the log and add
 them to the config as the port is brought up.
 
+Running it again on the same executable rewrites ``[xbe]`` and keeps the
+``[functions]``, ``[symbols]``, ``[data]`` and ``[abi]`` tables, so addresses
+found by ``xbe_symbols`` or proven by hand survive a rebuild.
+
 The tool never writes into ``assets/`` and never copies game data.
 """
 from __future__ import annotations
 
 import argparse
+import re
 import struct
 from pathlib import Path
 
@@ -182,19 +187,73 @@ class Xbe:
         return max(8, min(64, self.code_size() // 60000 or 8))
 
 
+def section_lines(text: str, name: str) -> list[str]:
+    """The body of a top-level ``[name]`` table, comments and order kept."""
+    body, inside = [], False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and not stripped.startswith("[["):
+            inside = stripped == f"[{name}]"
+            continue
+        if inside:
+            body.append(line)
+    while body and not body[0].strip():
+        body.pop(0)
+    # blank lines and a comment after the last key introduce the next table, not this one
+    while body and (not body[-1].strip() or body[-1].strip().startswith("#")):
+        body.pop()
+    return body
+
+
+def has_entries(lines: list[str]) -> bool:
+    """Whether a table body holds a key and not only comments."""
+    return any(line.strip() and not line.strip().startswith("#") and "=" in line for line in lines)
+
+
+def kept_tables(out: Path, title: int, entry: int) -> dict[str, list[str]]:
+    """The hand-proven tables of an existing config for the same executable.
+
+    Symbol addresses found by ``xbe_symbols`` or proven by hand are the
+    expensive part of a bring-up, so a rebuild of the same XBE keeps
+    ``[functions]``, ``[symbols]``, ``[data]`` and ``[abi]`` as they are.  A
+    config written for another executable is replaced instead of merged.
+    """
+    try:
+        text = out.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    identity: dict[str, int] = {}
+    for line in section_lines(text, "xbe"):
+        for key in ("title", "entry"):
+            match = re.match(rf"\s*{key}\s*=\s*(0x[0-9A-Fa-f]+|\d+)", line)
+            if match:
+                identity[key] = int(match.group(1), 0)
+    if identity.get("title") != title or identity.get("entry") != entry:
+        return {}
+    keep = {}
+    for name in ("functions", "symbols", "data", "abi"):
+        body = section_lines(text, name)
+        # an empty [symbols] or [data] says nothing worth carrying over
+        if name in ("functions", "abi") and body or has_entries(body):
+            keep[name] = body
+    return keep
+
+
 def write_config(xbe: Xbe, out: Path, xdk: int | None = None) -> tuple[int, bool]:
     if xdk is None:
         xdk, exact = xbe.choose_xdk()
     else:
         exact = xdk in xbe.library_builds()
     sections = xbe.executable_sections()
-    lines = [
+    keep = kept_tables(out, xbe.title_id, xbe.entry)
+    header = [
         "# Recompiler input for Sonic Heroes default.xbe, written by",
         "# tools/sonic_heroes.py from the builder's own executable.",
         "#",
-        "# This file contains no game data.  The [symbols] and [data] tables are",
-        "# intentionally empty: run xbe_symbols when the image's XDK build has",
-        "# checked-in signatures, or add the addresses as the port is brought up.",
+        "# This file contains no game data.  [symbols] and [data] start empty: run",
+        "# xbe_symbols when the image's XDK build has checked-in signatures, or add",
+        "# the addresses as the port is brought up.  A later run of this tool on the",
+        "# same executable rewrites [xbe] and keeps those tables.",
         "",
         "[xbe]",
         'path = "assets/default.xbe"',
@@ -204,17 +263,21 @@ def write_config(xbe: Xbe, out: Path, xdk: int | None = None) -> tuple[int, bool
         'out = "generated/game"',
         f"partitions = {xbe.partitions()}",
         "code_sections = [" + ", ".join(f'"{s}"' for s in sections) + "]",
-        "",
-        "# extra entry points",
-        "[functions]",
-        "",
-        "# functions the host replaces or calls by name, 0 where the image has none",
-        "[symbols]",
-        "",
-        "[data]",
-        "",
     ]
-    out.write_text("\n".join(lines), encoding="utf-8")
+    tables = []
+    for caption, name in (
+            ("# extra entry points", "functions"),
+            ("# functions the host replaces or calls by name, 0 where the image has none", "symbols"),
+            (None, "data"),
+            ("# argument locations, for a function that takes its API arguments in other than the declared places", "abi")):
+        # [abi] is written by xbe_symbols or by hand, so it appears only when there is one to keep
+        if name == "abi" and name not in keep:
+            continue
+        block = ([caption] if caption else []) + [f"[{name}]"]
+        if name in keep:
+            block.extend(keep[name])
+        tables.append("\n".join(block))
+    out.write_text("\n".join(header) + "\n\n" + "\n\n".join(tables) + "\n", encoding="utf-8")
     return xdk, exact
 
 

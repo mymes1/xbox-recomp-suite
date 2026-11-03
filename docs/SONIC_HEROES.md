@@ -89,6 +89,10 @@ adb install -r dist/SonicHeroes-arm64-debug.apk
 `xbe_symbols` if your image's XDK build has checked-in signatures, then
 recompiles. The first recompile can take 30–90 minutes on a weak machine.
 
+`config/game.toml` is yours to edit. Running the script again rewrites its
+`[xbe]` table from the XBE and keeps `[functions]`, `[symbols]`, `[data]` and
+`[abi]`, so addresses you add by hand are not thrown away.
+
 The Linux desktop build is:
 
 ```sh
@@ -145,12 +149,15 @@ audit. The following are **not** claimed as device-verified:
 - Full gameplay, level progression, sound and save compatibility.
 - The exact XDK library build of your executable and the symbol table it needs.
 
-The recompiler config is generated from your own XBE. If your image's XDK build
-has no checked-in signatures, the `[symbols]` table stays empty and the port
-will need those symbols identified before every host call is wired. The log
-reports unknown functions and the OGlue notes map the known Sonic Heroes fixes
-to the corresponding runtime areas. Treat the first boot as a bring-up, not a
-finished port.
+The recompiler config is generated from your own XBE. If your image's XDK
+build has no checked-in signatures, `xbe_symbols` cannot fill `[symbols]`, and
+`build.sh` says so. The guest code still recompiles and the APK still builds:
+the recompiler gives every XDK name the host binds a placeholder, so a call to
+one the config does not name stops with `not in this image` (or `... is unknown
+for this image, add it to the config`) instead of failing the build after the
+whole Android toolchain has run. Fill in `[symbols]` and `[data]` to get past
+those stubs, then check the log and the OGlue notes for the known Sonic Heroes
+fixes. Treat the first boot as a bring-up, not a finished port.
 
 ## OGlue patches
 

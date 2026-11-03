@@ -25,13 +25,16 @@ struct Hook {
 struct Config {
     std::string xbe_path;
     uint32_t title = 0, entry = 0;  // the image xbe_symbols wrote the config for, 0 = unchecked
+    uint32_t xdk = 0;               // [xbe] xdk = the layout build, 0 = none
     std::set<uint32_t> trace;       // functions whose calls and results are logged
     std::string out_dir;
     std::vector<std::string> code_sections;
     std::vector<std::string> code_prefixes;
     uint32_t partitions = 128;
     std::map<uint32_t, std::string> functions;  // extra entry points
-    // names the host binds to: functions it replaces and data it reads; 0 = not in this image
+    // names the host binds to: functions it replaces and data it reads; 0 = not in this image.
+    // Every name the selected xdk signatures.toml knows is added with 0 (main.cpp, AddXdkNames), so a
+    // config written before the symbol scan matched anything still gives the host its placeholders.
     std::map<std::string, uint32_t> symbols, data;
     std::map<std::string, uint32_t> layout;     // XDK data layout, emitted as XDK_<name>
     std::map<std::string, std::vector<std::string>> abi;  // where a symbol takes each argument, emitted as IMAGE_ABI

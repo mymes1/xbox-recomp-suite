@@ -5,7 +5,8 @@
 ## Implemented
 
 - `ports/SonicHeroes/` recompiler port with a generated-from-your-XBE config.
-- `tools/sonic_heroes.py` XBE header parser and config writer (6 unit tests).
+- `tools/sonic_heroes.py` XBE header parser and config writer (9 unit tests);
+  a rebuild keeps the `[functions]`, `[symbols]`, `[data]` and `[abi]` tables.
 - `ports/SonicHeroes/build.sh` ISO extraction, config generation, optional
   `xbe_symbols`, guest recompilation and Linux build.
 - `GameInfo` with the 60 FPS mobile profile and the shared settings panel.
@@ -26,6 +27,9 @@
 - Gameplay, level progression, sound, saves, cutscenes.
 - The exact XDK library build of your executable. If it has no checked-in
   signatures, the `[symbols]` table is empty and host calls must be identified.
+  The build compiles and packages in that state: the recompiler gives every XDK
+  name a placeholder, so the first host call stops with a message naming the
+  missing symbol instead of the build failing.
 - The touch overlay's feel and camera mapping on a real device.
 - Sustained 60 FPS and thermals on a specific phone.
 

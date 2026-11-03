@@ -46,6 +46,15 @@ using namespace kernel;
 #define SYM_D3DDevice_Present FFFFFE04
 #define HAS_D3DDevice_Present 0
 #endif
+// the D3D8 exports the shared signature set does not name
+#ifndef SYM_D3DDevice_LoadVertexShaderProgram
+#define SYM_D3DDevice_LoadVertexShaderProgram FFFFFE05
+#define HAS_D3DDevice_LoadVertexShaderProgram 0
+#endif
+#ifndef SYM_D3DDevice_SetBackBufferScale
+#define SYM_D3DDevice_SetBackBufferScale FFFFFE06
+#define HAS_D3DDevice_SetBackBufferScale 0
+#endif
 #ifndef XDK_CDevice_EmbeddedBuffers
 #define XDK_CDevice_EmbeddedBuffers 0
 #endif

@@ -47,7 +47,8 @@ static bool ParseExit(const toml::node* n, Hook::Exit& e) {
 //     on_true/on_false make it return bool and name "ret" or an instruction of the same function to jump to
 //   [[function]] at, end  an entry decoded no further than end (exclusive); it also stops other walks
 //   [[switch]] at, targets  the targets of an indirect jmp, replacing table detection
-//   [xbe] xdk = build  includes <--xdk folder>/<build>/layout.toml
+//   [xbe] xdk = build  includes <--xdk folder>/<build>/layout.toml and adds every name in its signatures.toml
+//     that [symbols] and [data] do not list, with address 0 (the host traps where such a name is first needed)
 //   [abi] name = ["esi", "stack", ...]  where a [symbols] function takes each API argument when the image does not
 //     use the convention the host declares: a register, or "stack" for the next stack slot, which the callee pops
 static bool LoadConfig(const fs::path& path, Config& cfg, const fs::path& xdk_dir) {
@@ -64,6 +65,7 @@ static bool LoadConfig(const fs::path& path, Config& cfg, const fs::path& xdk_di
             std::fprintf(stderr, "%s: [xbe] xdk = %lld needs --xdk <the SDK's xdk folder>\n", path.string().c_str(), (long long)*v);
             return false;
         }
+        cfg.xdk = uint32_t(*v);
         fs::path layout = xdk_dir / std::to_string(*v) / "layout.toml";
         if (!fs::exists(layout)) {
             std::fprintf(stderr, "%s: [xbe] xdk = %lld: %s does not exist\n", path.string().c_str(), (long long)*v,
@@ -168,6 +170,29 @@ static bool LoadConfig(const fs::path& path, Config& cfg, const fs::path& xdk_di
     return true;
 }
 
+// Every name this XDK build's host code can bind (sdk/xdk/<build>/signatures.toml lists them all) as a symbol with
+// no address unless the config gives one. A port whose signature scan matched nothing, or only some functions,
+// still gets a placeholder for each name, so the runtime links and traps "not in this image" where the missing name
+// is first needed, instead of failing to compile inside the XDK headers.
+static bool AddXdkNames(Config& cfg, const fs::path& xdk_dir) {
+    if (!cfg.xdk || xdk_dir.empty()) return true;
+    fs::path path = xdk_dir / std::to_string(cfg.xdk) / "signatures.toml";
+    if (!fs::exists(path)) return true;
+    toml::table t;
+    try {
+        t = toml::parse_file(path.string());
+    } catch (const toml::parse_error& e) {
+        std::fprintf(stderr, "%s: %s\n", path.string().c_str(), std::string(e.description()).c_str());
+        return false;
+    }
+    // symbols and anchors are functions, data are the XDK globals the host reads
+    for (auto [key, out] : {std::pair{"symbols", &cfg.symbols}, std::pair{"anchors", &cfg.symbols},
+                            std::pair{"data", &cfg.data}})
+        if (auto f = t[key].as_table())
+            for (auto& [k, v] : *f) out->emplace(std::string(k.str()), 0);
+    return true;
+}
+
 // overrides that analysis could not apply are config mistakes
 static bool CheckOverrides(const Analysis& an) {
     bool ok = true;
@@ -206,7 +231,7 @@ int main(int argc, char** argv) {
     }
     Config cfg;
     fs::path cfg_path = args[0];
-    if (!LoadConfig(cfg_path, cfg, xdk_dir)) return 1;
+    if (!LoadConfig(cfg_path, cfg, xdk_dir) || !AddXdkNames(cfg, xdk_dir)) return 1;
     for (auto& [name, locs] : cfg.abi)
         if (!cfg.symbols.count(name)) {
             std::fprintf(stderr, "%s: [abi] %s is not a [symbols] name\n", args[0].c_str(), name.c_str());

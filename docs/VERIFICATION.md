@@ -1,19 +1,24 @@
-# Verification record — updated 2026-10-21
+# Verification record — updated 2026-11-03
 
 ## Sonic Heroes bring-up (not device-verified)
 
 The Sonic Heroes port scaffold, XBE config generator, launcher integration,
 touch platformer overlay, virtual-controller bridge, performance governor and
-GitHub Actions workflow are implemented. `tools/sonic_heroes.py` has six unit
+GitHub Actions workflow are implemented. `tools/sonic_heroes.py` has nine unit
 tests (retail/debug entry keys, section/library parsing, config generation, XDK
-override, partition clamping) and they pass. The Git index audit passes: no
-game data, generated code, APKs or keys are staged.
+override, partition clamping, and keeping the hand-proven tables when the config
+is rewritten for the same executable) and they pass. The Git index audit passes:
+no game data, generated code, APKs or keys are staged.
 
 No retail Sonic Heroes ISO has been booted on a phone or desktop in this
 snapshot. Gameplay, rendering, audio, touch alignment, saves, sustained 60 FPS
 and thermals are unverified. The exact XDK library build and symbol table of the
 builder's executable are also unverified; `build.sh` reports when no checked-in
-signatures match and the port must be brought up from the generated config.
+signatures match and the port must be brought up from the generated config. In
+that state the guest code and the Android APK still build: the recompiler gives
+every XDK name the host binds a placeholder address, so an unresolved call stops
+at run time with the name it needs instead of surfacing as a compile error inside
+the XDK headers of the Android build.
 
 ## Chihiro Android additions
 
