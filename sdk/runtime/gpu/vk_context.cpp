@@ -353,7 +353,9 @@ bool Context::CreateDevice(bool want_swapchain) {
     VkPhysicalDeviceDynamicRenderingFeatures f_dr{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES};
     f_dr.dynamicRendering = VK_TRUE;
     VkPhysicalDeviceSynchronization2Features f_s2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES};
-    f_s2.synchronization2 = VK_TRUE;
+    // a feature struct in the chain must not ask for anything the device or its enabled extensions do not offer:
+    // a 1.1 Mali device has neither, and asking is a device creation failure rather than a fall-back
+    f_s2.synchronization2 = caps.sync2 ? VK_TRUE : VK_FALSE;
     VkPhysicalDeviceTimelineSemaphoreFeatures f_ts{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
     f_ts.timelineSemaphore = VK_TRUE;
     VkPhysicalDeviceHostQueryResetFeatures f_hq{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES};
