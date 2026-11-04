@@ -352,14 +352,6 @@ VkPrimitiveTopology PrimitiveTopology(const Assembled& a) {
     return a.strip ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 }
 
-VkPrimitiveTopology TopologyClass(uint32_t topo) {
-    switch (topo) {
-        case 0: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
-        case 1: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
-        default: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    }
-}
-
 constexpr uint32_t kFillWireframe = 0x1B01;
 constexpr float kUpscaledMin = 1.01f;
 constexpr float kGlowBoxTexels = 3.0f;
@@ -477,6 +469,9 @@ VulkanRenderer::~VulkanRenderer() {
     for (auto& [k, p] : passes_)
         if (p) vkDestroyRenderPass(ctx_.dev, p, nullptr);
     for (Frame& f : frames_) {
+        // the draws' descriptor sets first: they name the views and samplers that go after them
+        for (VkDescriptorPool p : f.desc_pools) vkDestroyDescriptorPool(ctx_.dev, p, nullptr);
+        f.desc_pools.clear();
         for (VkSampler s : f.samplers) vkDestroySampler(ctx_.dev, s, nullptr);
         f.images.clear();
         f.buffers.clear();
@@ -518,10 +513,9 @@ bool VulkanRenderer::Init(uint32_t width, uint32_t height) {
     }
     g_push = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(vkGetDeviceProcAddr(ctx_.dev, "vkCmdPushDescriptorSet"));
     if (!g_push) g_push = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(vkGetDeviceProcAddr(ctx_.dev, "vkCmdPushDescriptorSetKHR"));
-    if (!g_push) {
-        LOGE("vulkan: no push descriptors");
-        return false;
-    }
+    // Mali drivers up to Arm's recent ones have no VK_KHR_push_descriptor: each draw writes and binds a set from
+    // the frame's pool instead, which is the same descriptors through the 1.0 call
+    ctx_.caps.push_descriptors = g_push != nullptr;
     CreateLayouts();
     if (!CreateFrames()) return false;
     Begin();
@@ -546,7 +540,7 @@ void VulkanRenderer::CreateLayouts() {
                                                      : VK_DESCRIPTOR_TYPE_SAMPLER;
     }
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+    if (ctx_.caps.push_descriptors) li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
     li.bindingCount = kBindingCount;
     li.pBindings = b;
     vkCreateDescriptorSetLayout(ctx_.dev, &li, nullptr, &set_layout_);
@@ -638,12 +632,13 @@ void VulkanRenderer::Submit(bool wait, VkSemaphore acquired, VkSemaphore done) {
     si.pCommandBufferInfos = &cbi;
     si.signalSemaphoreInfoCount = done ? 2 : 1;
     si.pSignalSemaphoreInfos = signals;
-    if (VkResult r = ctx_.d.QueueSubmit2(ctx_.queue, 1, &si, VK_NULL_HANDLE); r != VK_SUCCESS) {
+    if (VkResult r = ctx_.Submit(si, VK_NULL_HANDLE); r != VK_SUCCESS) {
         LOGE("vulkan: submit failed (%d)", int(r));
     }
     if (wait) {
         ctx_.Wait(fence_value_);
         vkResetCommandPool(ctx_.dev, f.pool, 0);
+        for (VkDescriptorPool p : f.desc_pools) vkResetDescriptorPool(ctx_.dev, p, 0);
         DropSlotFramebuffers();
         f.images.clear();
         f.buffers.clear();
@@ -841,8 +836,13 @@ void VulkanRenderer::BeginRendering(const Attachments& a, uint32_t w, uint32_t h
         bi.renderArea = {{0, 0}, {w, h}};
         LOG_FIRST(4, "vulkan: render pass scope %ux%u pass %p framebuffer %p format %d depth %d", w, h, (void*)bi.renderPass,
                   (void*)bi.framebuffer, int(a.color ? a.color->desc.format : VK_FORMAT_UNDEFINED), int(a.depth != nullptr));
-        if (!bi.renderPass || !bi.framebuffer)
-            LOGE("vulkan: begin render pass %p framebuffer %p (%ux%u)", bi.renderPass, bi.framebuffer, w, h);
+        if (!bi.renderPass || !bi.framebuffer) {
+            // no scope to draw in: the draws are dropped rather than recorded against nothing, which a driver
+            // would fault on
+            LOG_FIRST(2, "vulkan: no render pass %p framebuffer %p for %ux%u: the draws into it are skipped",
+                      (void*)bi.renderPass, (void*)bi.framebuffer, w, h);
+            return;
+        }
         vkCmdBeginRenderPass(Cb(), &bi, VK_SUBPASS_CONTENTS_INLINE);
     }
     rendering_ = true;
@@ -966,7 +966,51 @@ void VulkanRenderer::PushDescriptors(VkBuffer cb0, uint64_t off0, uint64_t size0
         w[kBindingSamplers + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
         w[kBindingSamplers + i].pImageInfo = &smps[i];
     }
-    g_push(Cb(), VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, kBindingCount, w);
+    if (ctx_.caps.push_descriptors) {
+        g_push(Cb(), VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, kBindingCount, w);
+        return;
+    }
+    VkDescriptorSet set = AllocDrawDescriptors();
+    if (set == VK_NULL_HANDLE) return;
+    for (VkWriteDescriptorSet& x : w) x.dstSet = set;
+    vkUpdateDescriptorSets(ctx_.dev, kBindingCount, w, 0, nullptr);
+    vkCmdBindDescriptorSets(Cb(), VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &set, 0, nullptr);
+}
+
+// A descriptor set for one draw from the frame's pool, made larger as the frame needs more. The sets go with the
+// frame: resetting the pool frees every one of them at once, once the GPU is done with the command buffer.
+VkDescriptorSet VulkanRenderer::AllocDrawDescriptors() {
+    Frame& f = CurrentFrame();
+    constexpr uint32_t kSetsPerPool = 2048;
+    for (;;) {
+        if (!f.desc_pools.empty()) {
+            VkDescriptorSetLayout layouts[1] = {set_layout_};
+            VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            ai.descriptorPool = f.desc_pools.back();
+            ai.descriptorSetCount = 1;
+            ai.pSetLayouts = layouts;
+            VkDescriptorSet set = VK_NULL_HANDLE;
+            if (vkAllocateDescriptorSets(ctx_.dev, &ai, &set) == VK_SUCCESS) return set;
+        }
+        if (f.desc_pools.size() >= 16) {
+            LOG_FIRST(4, "vulkan: the frame's descriptor pools are full: %zu pools of %u sets", f.desc_pools.size(),
+                      kSetsPerPool);
+            return VK_NULL_HANDLE;
+        }
+        VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 * kSetsPerPool},
+                                         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4 * kSetsPerPool},
+                                         {VK_DESCRIPTOR_TYPE_SAMPLER, 4 * kSetsPerPool}};
+        VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        pi.maxSets = kSetsPerPool;
+        pi.poolSizeCount = 3;
+        pi.pPoolSizes = sizes;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        if (vkCreateDescriptorPool(ctx_.dev, &pi, nullptr, &pool) != VK_SUCCESS) {
+            LOGE("vulkan: no descriptor pool for the frame's draws");
+            return VK_NULL_HANDLE;
+        }
+        f.desc_pools.push_back(pool);
+    }
 }
 
 // ---------------------------------------------------------------- targets
@@ -1516,6 +1560,8 @@ void VulkanRenderer::BuildPipelineKey(const State& s, const Assembled& a, uint64
         }
     }
     k.topo = uint32_t(a.topology);
+    k.strip = a.strip ? 1 : 0;
+    for (uint32_t i = 0; i < a.buffer_count; i++) k.strides[i] = std::min(a.buffers[i].stride, 0xFFFFu);
     k.has_rt = bound_rt_ != nullptr;
     k.has_ds = bound_ds_ != nullptr;
     k.rtfmt = bound_rt_ ? uint32_t(bound_rt_->fmt) : 0;
@@ -1543,7 +1589,10 @@ VkPipeline VulkanRenderer::EnsurePipeline(const PsoKey& k, VkShaderModule vs, Vk
         na++;
         if (!bound[buffer]) {
             bound[buffer] = true;
-            binds[nb++] = {buffer, 0, VK_VERTEX_INPUT_RATE_VERTEX};  // the stride is set per draw
+            // with VK_EXT_extended_dynamic_state the stride is a dynamic state set per draw; a device without it
+            // (Mali) reads the stride from here, which the key carries
+            binds[nb++] = {buffer, ctx_.caps.extended_dynamic_state ? 0u : k.strides[buffer],
+                           VK_VERTEX_INPUT_RATE_VERTEX};
         }
     }
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -1572,7 +1621,11 @@ VkPipeline VulkanRenderer::EnsurePipeline(const PsoKey& k, VkShaderModule vs, Vk
         }
     }
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    ia.topology = TopologyClass(k.topo);
+    // the key holds the topology exactly - strip or list - so the pipeline does and no draw has to set it
+    ia.topology = k.topo == uint32_t(Topology::Points)  ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST
+                  : k.topo == uint32_t(Topology::Lines) ? (k.strip ? VK_PRIMITIVE_TOPOLOGY_LINE_STRIP
+                                                                  : VK_PRIMITIVE_TOPOLOGY_LINE_LIST)
+                  : (k.strip ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
     VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     vp.viewportCount = vp.scissorCount = 1;
     VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
@@ -1609,11 +1662,12 @@ VkPipeline VulkanRenderer::EnsurePipeline(const PsoKey& k, VkShaderModule vs, Vk
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cb.attachmentCount = k.has_rt ? 1 : 0;
     cb.pAttachments = &b;
-    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,
-                            VK_DYNAMIC_STATE_BLEND_CONSTANTS,   VK_DYNAMIC_STATE_STENCIL_REFERENCE,
-                            VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
+    VkDynamicState dyn[5] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+                             VK_DYNAMIC_STATE_STENCIL_REFERENCE};
+    uint32_t ndyn = 4;
+    if (ctx_.caps.extended_dynamic_state) dyn[ndyn++] = VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE;
     VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dy.dynamicStateCount = uint32_t(std::size(dyn));
+    dy.dynamicStateCount = ndyn;
     dy.pDynamicStates = dyn;
     VkFormat rtfmt = VkFormat(k.rtfmt);
     VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
@@ -1722,6 +1776,10 @@ void VulkanRenderer::SetViewportScissor(const State& s, uint32_t gw) {
 }
 
 void VulkanRenderer::DrawGeometry(const Assembled& a) {
+    if (!rendering_) {
+        LOG_FIRST(2, "vulkan: geometry drawn with no rendering scope open: skipped");
+        return;
+    }
     VkBuffer bufs[16];
     VkDeviceSize offs[16], strides[16];
     for (uint32_t i = 0; i < a.buffer_count; i++) {
@@ -1732,8 +1790,13 @@ void VulkanRenderer::DrawGeometry(const Assembled& a) {
         offs[i] = vb.off;
         strides[i] = b.stride;
     }
-    if (a.buffer_count) ctx_.d.BindVertexBuffers2(Cb(), 0, a.buffer_count, bufs, offs, nullptr, strides);
-    ctx_.d.SetPrimitiveTopology(Cb(), PrimitiveTopology(a));
+    if (a.buffer_count) {
+        if (ctx_.caps.extended_dynamic_state) {
+            ctx_.d.BindVertexBuffers2(Cb(), 0, a.buffer_count, bufs, offs, nullptr, strides);
+        } else {
+            vkCmdBindVertexBuffers(Cb(), 0, a.buffer_count, bufs, offs);  // the pipeline carries the strides
+        }
+    }
     if (a.index_count) {
         uint32_t ibytes = a.index_count * (a.index16 ? 2 : 4);
         Alloc ib = Upload(ibytes, 4);

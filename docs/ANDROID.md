@@ -114,6 +114,28 @@ The corrected device build retained the three offscreen framebuffers and
 completed intro/title playback. BLACK's custom renderer already applies the
 same lifetime rule.
 
+Arm's Mali driver, which Samsung's tablets and most MediaTek phones ship, is a
+Vulkan 1.1 implementation: no dynamic rendering, no `VK_KHR_synchronization2`,
+no `VK_KHR_push_descriptor` and, on older revisions, no
+`VK_EXT_extended_dynamic_state`. None of those is a startup requirement any
+more. The context translates sync2 barriers and submits to
+`vkCmdPipelineBarrier`/`vkQueueSubmit`, the renderer draws through render passes
+where rendering scopes are missing, writes a descriptor set per draw from the
+frame's pool where push descriptors are missing, and bakes the primitive
+topology and vertex binding strides into the pipeline where the extended dynamic
+state is missing. The startup log names the device and which path each feature
+took, so a device report says at once what is running:
+
+```
+vulkan: Mali-G57, vendor 13B5, driver 32.1.0, Vulkan 1.1.177, depth D24S8, samples -42-
+vulkan: rendering scopes no (render passes), synchronization2 no (the 1.0 calls),
+        dynamic vertex stride no (pipelines carry it), push descriptors no (a set per draw),
+        timeline semaphores yes, custom border colours yes
+```
+
+`XBE_VK_RENDERPASS=1` forces the render pass path on a device that has both, and
+`XBE_VK_DEVICE=<name>` picks a device on a multi-GPU host.
+
 The shared audio mixer retains mix-in bus routing, so PGR's opponent engines
 inherit volume and 3D placement. Its XDK 3925 sound-mode wrapper is identified
 separately from maximum distance. Final stereo peak limiting prevents overloaded

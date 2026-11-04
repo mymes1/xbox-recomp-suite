@@ -63,14 +63,17 @@ struct Caps {
     // extensions. rendering scopes are the one that a device may simply not have at all, and the
     // renderer then draws through render passes instead.
     bool dynamic_rendering = false;       // core 1.3 rendering scopes, else the render pass fallback
-    bool sync2 = false;                   // vkCmdPipelineBarrier2 / vkQueueSubmit2
+    bool sync2 = false;                   // vkCmdPipelineBarrier2 / vkQueueSubmit2, else the v1 fallbacks below
     bool timeline = false;                // timeline semaphores
     bool host_query_reset = false;        // vkResetQueryPool
     bool scalar_layout = false;           // VK_EXT_scalar_block_layout
-    bool extended_dynamic_state = false;  // dynamic primitive topology and vertex binding stride
+    bool extended_dynamic_state = false;  // dynamic vertex binding stride, else the pipeline carries it
+    bool push_descriptors = false;        // VK_KHR_push_descriptor, else a descriptor set per draw
     float max_anisotropy = 1;
     VkSampleCountFlags color_samples = VK_SAMPLE_COUNT_1_BIT, depth_samples = VK_SAMPLE_COUNT_1_BIT;
     std::string device_name;
+    uint32_t vendor = 0;          // 0x13B5 is Arm (Mali), 0x5143 Qualcomm (Adreno)
+    uint32_t driver_version = 0;  // the driver's own numbering, e.g. Mali 32.1.0 for v1.r32p1
 };
 
 // entry points that only exist as KHR/EXT below the version that promoted them: Android's loader
@@ -82,7 +85,6 @@ struct Dispatch {
     PFN_vkWaitSemaphores WaitSemaphores = nullptr;
     PFN_vkResetQueryPool ResetQueryPool = nullptr;
     PFN_vkCmdBindVertexBuffers2 BindVertexBuffers2 = nullptr;
-    PFN_vkCmdSetPrimitiveTopology SetPrimitiveTopology = nullptr;
     // rendering scopes: not a required entry point (a 1.1 device has no dynamic rendering), so resolved but not checked
     PFN_vkCmdBeginRendering CmdBeginRendering = nullptr;
     PFN_vkCmdEndRendering CmdEndRendering = nullptr;
@@ -112,6 +114,12 @@ public:
     VkSemaphore timeline = VK_NULL_HANDLE;
     uint64_t Completed() const;
     void Wait(uint64_t value) const;
+
+    // synchronization2 where the device has it, synchronization1 otherwise (Arm's Mali driver before Vulkan
+    // 1.3 offers neither vkCmdPipelineBarrier2 nor vkQueueSubmit2, and most of them have neither extension):
+    // the same dependencies, translated to the 1.0 stage and access flags and issued with the old calls
+    void Barrier(VkCommandBuffer cb, const VkDependencyInfo& di);
+    VkResult Submit(const VkSubmitInfo2& si, VkFence fence);
 
 private:
     VkDebugUtilsMessengerEXT messenger_ = VK_NULL_HANDLE;

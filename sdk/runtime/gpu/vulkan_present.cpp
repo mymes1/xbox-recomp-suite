@@ -274,6 +274,7 @@ void VulkanRenderer::ResetFrame() {
         g_perf.wait += PerfMs(perf_wait);
     }
     vkResetCommandPool(ctx_.dev, f.pool, 0);
+    for (VkDescriptorPool p : f.desc_pools) vkResetDescriptorPool(ctx_.dev, p, 0);
     DropSlotFramebuffers();
     f.images.clear();
     f.buffers.clear();

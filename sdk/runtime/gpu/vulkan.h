@@ -86,7 +86,9 @@ struct Tex {
 struct PsoKey {
     uint64_t vs, ps;
     uint32_t regs, topo, has_rt, has_ds;
+    uint32_t strip;         // line or triangle strip: the topology is in the pipeline, not a dynamic state
     uint32_t elements[16];  // per register: DXGI format, buffer << 8, offset << 16
+    uint32_t strides[16];   // per buffer: only read where the device has no dynamic vertex input stride
     uint32_t blend, src, dst, op, wmask;
     uint32_t zen, zwrite, zfunc, sten, sfunc, smask, swmask, sfail, szfail, spass;
     uint32_t cull, ccw, fill;
@@ -188,6 +190,9 @@ private:
     struct Frame {
         VkCommandPool pool = VK_NULL_HANDLE;
         VkCommandBuffer cb = VK_NULL_HANDLE;
+        // the draws' descriptor sets, where the device has no push descriptors (Mali): one per draw, freed with
+        // the frame by resetting the pools
+        std::vector<VkDescriptorPool> desc_pools;
         BufferRef upload;
         uint64_t used = 0;
         uint64_t fence = 0;
@@ -275,6 +280,7 @@ private:
     VkSampler BlitSampler(bool linear);
     void PushDescriptors(VkBuffer cb0, uint64_t off0, uint64_t size0, VkBuffer cb1, uint64_t off1, uint64_t size1,
                          Image* const tex[4], const uint8_t kinds[4], VkSampler const smp[4]);
+    VkDescriptorSet AllocDrawDescriptors();
     VkShaderModule Compile(const std::string& src, const char* entry, Stage stage, uint64_t& hash);
 
     // targets

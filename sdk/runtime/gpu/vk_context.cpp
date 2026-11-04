@@ -168,8 +168,18 @@ bool Context::Init(const char* const* instance_extensions, uint32_t count, bool 
     tci.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
     VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &tci};
     vkCreateSemaphore(dev, &sci, nullptr, &timeline);
-    LOGI("vulkan: %s, depth %s, custom border colours %s", caps.device_name.c_str(),
-         caps.depth_format == VK_FORMAT_D24_UNORM_S8_UINT ? "D24S8" : "D32S8", caps.custom_border ? "yes" : "no");
+    // the report a device's log needs: what it is, what it offered, and which fall-backs are running
+    LOGI("vulkan: %s, vendor %04X, driver %u.%u.%u, Vulkan %u.%u.%u, depth %s, samples %c%c%c%c", caps.device_name.c_str(),
+         caps.vendor, VK_API_VERSION_MAJOR(caps.driver_version), VK_API_VERSION_MINOR(caps.driver_version),
+         VK_API_VERSION_PATCH(caps.driver_version), VK_API_VERSION_MAJOR(device_api_), VK_API_VERSION_MINOR(device_api_),
+         VK_API_VERSION_PATCH(device_api_), caps.depth_format == VK_FORMAT_D24_UNORM_S8_UINT ? "D24S8" : "D32S8",
+         caps.color_samples & VK_SAMPLE_COUNT_8_BIT ? '8' : '-', caps.color_samples & VK_SAMPLE_COUNT_4_BIT ? '4' : '-',
+         caps.color_samples & VK_SAMPLE_COUNT_2_BIT ? '2' : '-', caps.color_samples & VK_SAMPLE_COUNT_1_BIT ? '1' : '-');
+    LOGI("vulkan: rendering scopes %s, synchronization2 %s, dynamic vertex stride %s, push descriptors %s, "
+         "timeline semaphores %s, custom border colours %s",
+         caps.dynamic_rendering ? "yes" : "no (render passes)", caps.sync2 ? "yes" : "no (the 1.0 calls)",
+         caps.extended_dynamic_state ? "yes" : "no (pipelines carry it)", caps.push_descriptors ? "yes" : "no (a set per draw)",
+         caps.timeline ? "yes" : "no", caps.custom_border ? "yes" : "no");
     return true;
 }
 
@@ -215,6 +225,8 @@ bool Context::CreateDevice(bool want_swapchain) {
     // the version the device is used at: its own, capped by what the instance asked for
     device_api_ = std::min(pr.apiVersion, api_);
     device_api = device_api_;
+    caps.vendor = pr.vendorID;
+    caps.driver_version = pr.driverVersion;
     const bool v12 = device_api_ >= VK_API_VERSION_1_2, v13 = device_api_ >= VK_API_VERSION_1_3;
 #ifdef XBE_VK_HAVE_1_4
     const bool v14 = device_api_ >= VK_API_VERSION_1_4;
@@ -226,12 +238,14 @@ bool Context::CreateDevice(bool want_swapchain) {
 
     std::vector<const char*> exts;
     if (want_swapchain) exts.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    // push descriptors are core in 1.4 and an extension below it; a device with neither (Mali) binds a set per draw,
+    // which is why this one is asked for but not required
+    caps.push_descriptors = v14;
     if (!v14) {
-        if (!has(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) {
-            LOGE("vulkan: %s has no push descriptors", caps.device_name.c_str());
-            return false;
+        if (has(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) {
+            exts.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+            caps.push_descriptors = true;
         }
-        exts.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
         if (has(VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) exts.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
     }
 
@@ -272,14 +286,10 @@ bool Context::CreateDevice(bool want_swapchain) {
         LOGE("vulkan: %s has no timeline semaphores", caps.device_name.c_str());
         return false;
     }
-    if (!caps.sync2) {
-        LOGE("vulkan: %s has no synchronization2", caps.device_name.c_str());
-        return false;
-    }
-    if (!caps.extended_dynamic_state) {
-        LOGE("vulkan: %s has no extended dynamic state", caps.device_name.c_str());
-        return false;
-    }
+    // Mali (Arm's driver, and the MediaTek Image drivers phones ship) is a Vulkan 1.1 device in most versions
+    // without VK_KHR_synchronization2 and VK_EXT_extended_dynamic_state: both have fall-backs, so neither is fatal
+    if (!caps.sync2) LOGI("vulkan: %s has no synchronization2: barriers and submits use the Vulkan 1.0 calls", caps.device_name.c_str());
+    if (!caps.extended_dynamic_state) LOGI("vulkan: %s has no extended dynamic state: pipelines carry their vertex strides", caps.device_name.c_str());
 
     caps.custom_border = has(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
     if (caps.custom_border) exts.push_back(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
@@ -287,7 +297,9 @@ bool Context::CreateDevice(bool want_swapchain) {
     if (caps.hdr_metadata) exts.push_back(VK_EXT_HDR_METADATA_EXTENSION_NAME);
 
     // what the device has, then what is turned on
+    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT have_eds{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT};
     VkPhysicalDeviceCustomBorderColorFeaturesEXT have_border{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
+    if (!v13) have_border.pNext = &have_eds;  // promoted and mandatory in 1.3, so only a 1.1/1.2 device has the bit
     VkPhysicalDeviceSynchronization2Features have_s2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES, &have_border};
     VkPhysicalDeviceTimelineSemaphoreFeatures have_ts{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES, &have_s2};
     VkPhysicalDeviceHostQueryResetFeatures have_hq{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES, &have_ts};
@@ -311,11 +323,14 @@ bool Context::CreateDevice(bool want_swapchain) {
     caps.sync2 = caps.sync2 && have_s2.synchronization2;
     caps.host_query_reset = caps.host_query_reset && have_hq.hostQueryReset;
     caps.scalar_layout = caps.scalar_layout && have_sb.scalarBlockLayout;
+    if (!v13) caps.extended_dynamic_state = caps.extended_dynamic_state && have_eds.extendedDynamicState;
     caps.queries = caps.host_query_reset && have.features.occlusionQueryPrecise;
     caps.geometry = have.features.geometryShader;
     // XBE_VK_RENDERPASS: draw through render passes even where rendering scopes exist, to exercise the fall-back
     if (std::getenv("XBE_VK_RENDERPASS")) caps.dynamic_rendering = false;
 
+    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT f_eds{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT};
+    f_eds.extendedDynamicState = VK_TRUE;
     VkPhysicalDeviceCustomBorderColorFeaturesEXT border{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
     border.customBorderColors = caps.custom_border;
     border.customBorderColorWithoutFormat = caps.custom_border;
@@ -329,7 +344,7 @@ bool Context::CreateDevice(bool want_swapchain) {
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     f13.dynamicRendering = VK_TRUE;
     f13.synchronization2 = VK_TRUE;
-    f13.maintenance4 = VK_TRUE;
+    f13.maintenance4 = VK_TRUE;  // the dynamic vertex input stride is mandatory core state in 1.3, no bit to ask for
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.timelineSemaphore = VK_TRUE;
     f12.scalarBlockLayout = caps.scalar_layout;
@@ -385,6 +400,10 @@ bool Context::CreateDevice(bool want_swapchain) {
         *tail = &m5;
         tail = &m5.pNext;
     }
+    if (caps.extended_dynamic_state && !modern) {
+        *tail = &f_eds;
+        tail = &f_eds.pNext;
+    }
     if (caps.custom_border) *tail = &border;
     if (!have.features.textureCompressionBC) LOGW("vulkan: no BC textures, DXT textures will not show");
 
@@ -417,15 +436,21 @@ bool Context::CreateDevice(bool want_swapchain) {
     d.WaitSemaphores = (PFN_vkWaitSemaphores)get("vkWaitSemaphores", "vkWaitSemaphoresKHR");
     d.ResetQueryPool = (PFN_vkResetQueryPool)get("vkResetQueryPool", "vkResetQueryPoolEXT");
     d.BindVertexBuffers2 = (PFN_vkCmdBindVertexBuffers2)get("vkCmdBindVertexBuffers2", "vkCmdBindVertexBuffers2EXT");
-    d.SetPrimitiveTopology = (PFN_vkCmdSetPrimitiveTopology)get("vkCmdSetPrimitiveTopology", "vkCmdSetPrimitiveTopologyEXT");
     // rendering scopes, where the device has them; Android's loader does not export them, so they only ever come
     // from a proc address (and a 1.1 device does not offer them at all)
     d.CmdBeginRendering = (PFN_vkCmdBeginRendering)get("vkCmdBeginRendering", "vkCmdBeginRenderingKHR");
     d.CmdEndRendering = (PFN_vkCmdEndRendering)get("vkCmdEndRendering", "vkCmdEndRenderingKHR");
-    // check required ones
-    if (!d.PipelineBarrier2 || !d.QueueSubmit2 || !d.GetSemaphoreCounterValue || !d.WaitSemaphores || !d.BindVertexBuffers2 || !d.SetPrimitiveTopology) {
-        LOGE("vulkan: failed to resolve promoted entry points");
+    // the timeline semaphore's entry points are the only ones every path needs; the synchronization2, dynamic
+    // state and query ones above all have fall-backs
+    if (!d.GetSemaphoreCounterValue || !d.WaitSemaphores) {
+        LOGE("vulkan: failed to resolve the timeline semaphore entry points");
         return false;
+    }
+    // synchronization2 missing, or offered as an extension the driver does not actually implement: keep to the
+    // 1.0 calls, which every device has
+    if (!d.PipelineBarrier2 || !d.QueueSubmit2) {
+        if (caps.sync2) LOGI("vulkan: %s does not resolve the synchronization2 entry points", caps.device_name.c_str());
+        caps.sync2 = false;
     }
     // rendering scopes need their entry points to have resolved
     if (caps.dynamic_rendering && (!d.CmdBeginRendering || !d.CmdEndRendering)) {
@@ -436,6 +461,7 @@ bool Context::CreateDevice(bool want_swapchain) {
         caps.host_query_reset = false;
         caps.queries = false;
     }
+    if (caps.extended_dynamic_state && !d.BindVertexBuffers2) caps.extended_dynamic_state = false;
 
     LOGI("vulkan: device api %u.%u.%u (instance %u.%u.%u), dynamic rendering %d, sync2 %d", VK_API_VERSION_MAJOR(device_api_),
          VK_API_VERSION_MINOR(device_api_), VK_API_VERSION_PATCH(device_api_), VK_API_VERSION_MAJOR(api_),
@@ -524,6 +550,115 @@ void Context::Wait(uint64_t value) const {
 
 namespace {
 
+// the Vulkan 1.0 stage bit for a synchronization2 stage mask. Most of the bits hold the same value in both;
+// a mask with one the old flags have no name for is widened to every stage, which is always correct
+VkPipelineStageFlags Stage1(VkPipelineStageFlags2 m) {
+    VkPipelineStageFlags out = 0;
+    if (m & VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT) out |= VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    if (m & VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT) out |= VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
+    if (m & VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT) out |= VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
+    if (m & VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT) out |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
+    if (m & VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT) out |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    if (m & VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT) out |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    if (m & VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT) out |= VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    if (m & VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) out |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    if (m & VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) out |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    if (m & VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT) out |= VK_PIPELINE_STAGE_TRANSFER_BIT;
+    if (m & VK_PIPELINE_STAGE_2_HOST_BIT) out |= VK_PIPELINE_STAGE_HOST_BIT;
+    if (m & VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT) out |= VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
+    if (m & VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT) out |= VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    if (!out && m) out = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    return out;
+}
+
+// likewise the accesses: the sampling and storage reads sit above the 32 bit flags of Vulkan 1.0
+VkAccessFlags Access1(VkAccessFlags2 a) {
+    VkAccessFlags out = VkAccessFlags(a & 0xFFFFFFFFull);
+    if (a & (VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT)) out |= VK_ACCESS_SHADER_READ_BIT;
+    if (a & VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT) out |= VK_ACCESS_SHADER_WRITE_BIT;
+    return out;
+}
+
+}  // namespace
+
+// A Vulkan 1.1 device without synchronization2 - Mali, on most Android builds - gets the same dependencies from
+// vkCmdPipelineBarrier: one barrier per struct, with the stage masks gathered into the call's two masks
+void Context::Barrier(VkCommandBuffer cb, const VkDependencyInfo& di) {
+    if (caps.sync2) {
+        d.PipelineBarrier2(cb, &di);
+        return;
+    }
+    std::vector<VkMemoryBarrier> mem(di.memoryBarrierCount);
+    std::vector<VkBufferMemoryBarrier> buf(di.bufferMemoryBarrierCount);
+    std::vector<VkImageMemoryBarrier> img(di.imageMemoryBarrierCount);
+    VkPipelineStageFlags src = 0, dst = 0;
+    for (uint32_t i = 0; i < di.memoryBarrierCount; i++) {
+        const VkMemoryBarrier2& m = di.pMemoryBarriers[i];
+        src |= Stage1(m.srcStageMask);
+        dst |= Stage1(m.dstStageMask);
+        mem[i] = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, Access1(m.srcAccessMask), Access1(m.dstAccessMask)};
+    }
+    for (uint32_t i = 0; i < di.bufferMemoryBarrierCount; i++) {
+        const VkBufferMemoryBarrier2& b = di.pBufferMemoryBarriers[i];
+        src |= Stage1(b.srcStageMask);
+        dst |= Stage1(b.dstStageMask);
+        buf[i] = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr, Access1(b.srcAccessMask), Access1(b.dstAccessMask),
+                  b.srcQueueFamilyIndex, b.dstQueueFamilyIndex, b.buffer, b.offset, b.size};
+    }
+    for (uint32_t i = 0; i < di.imageMemoryBarrierCount; i++) {
+        const VkImageMemoryBarrier2& b = di.pImageMemoryBarriers[i];
+        src |= Stage1(b.srcStageMask);
+        dst |= Stage1(b.dstStageMask);
+        img[i] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, Access1(b.srcAccessMask),
+                  Access1(b.dstAccessMask), b.oldLayout, b.newLayout, b.srcQueueFamilyIndex,
+                  b.dstQueueFamilyIndex, b.image, b.subresourceRange};
+    }
+    // the 1.0 calls take no empty stage mask: the top of the pipe waits for nothing, every stage waits
+    if (!src) src = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    if (!dst) dst = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    vkCmdPipelineBarrier(cb, src, dst, 0, uint32_t(mem.size()), mem.empty() ? nullptr : mem.data(),
+                         uint32_t(buf.size()), buf.empty() ? nullptr : buf.data(), uint32_t(img.size()),
+                         img.empty() ? nullptr : img.data());
+}
+
+// a submit the same way: vkQueueSubmit, with the timeline values carried by VkTimelineSemaphoreSubmitInfo
+VkResult Context::Submit(const VkSubmitInfo2& si, VkFence fence) {
+    if (caps.sync2) return d.QueueSubmit2(queue, 1, &si, fence);
+    std::vector<VkSemaphore> waits, signals;
+    std::vector<VkPipelineStageFlags> stages;
+    std::vector<uint64_t> wait_values, signal_values;
+    for (uint32_t i = 0; i < si.waitSemaphoreInfoCount; i++) {
+        const VkSemaphoreSubmitInfo& w = si.pWaitSemaphoreInfos[i];
+        waits.push_back(w.semaphore);
+        const VkPipelineStageFlags st = Stage1(w.stageMask);
+        stages.push_back(st ? st : VkPipelineStageFlags(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT));
+        wait_values.push_back(w.value);
+    }
+    for (uint32_t i = 0; i < si.signalSemaphoreInfoCount; i++) {
+        const VkSemaphoreSubmitInfo& s = si.pSignalSemaphoreInfos[i];
+        signals.push_back(s.semaphore);
+        signal_values.push_back(s.value);
+    }
+    std::vector<VkCommandBuffer> cbs;
+    for (uint32_t i = 0; i < si.commandBufferInfoCount; i++) cbs.push_back(si.pCommandBufferInfos[i].commandBuffer);
+    VkTimelineSemaphoreSubmitInfo values{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    values.waitSemaphoreValueCount = uint32_t(wait_values.size());
+    values.pWaitSemaphoreValues = wait_values.empty() ? nullptr : wait_values.data();
+    values.signalSemaphoreValueCount = uint32_t(signal_values.size());
+    values.pSignalSemaphoreValues = signal_values.empty() ? nullptr : signal_values.data();
+    VkSubmitInfo s{VK_STRUCTURE_TYPE_SUBMIT_INFO, &values};
+    s.waitSemaphoreCount = uint32_t(waits.size());
+    s.pWaitSemaphores = waits.empty() ? nullptr : waits.data();
+    s.pWaitDstStageMask = stages.empty() ? nullptr : stages.data();
+    s.commandBufferCount = uint32_t(cbs.size());
+    s.pCommandBuffers = cbs.data();
+    s.signalSemaphoreCount = uint32_t(signals.size());
+    s.pSignalSemaphores = signals.empty() ? nullptr : signals.data();
+    return vkQueueSubmit(queue, 1, &s, fence);
+}
+
+namespace {
+
 // the stages and accesses an image in a layout is used with, the two sides of a barrier
 struct Use {
     VkPipelineStageFlags2 stage;
@@ -577,7 +712,7 @@ void Transition(Context& ctx, VkCommandBuffer cb, Image& img, VkImageLayout to) 
     VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     di.imageMemoryBarrierCount = 1;
     di.pImageMemoryBarriers = &b;
-    ctx.d.PipelineBarrier2(cb, &di);
+    ctx.Barrier(cb, di);
     img.layout = to;
 }
 
@@ -592,7 +727,7 @@ void AttachmentDependency(Context& ctx, VkCommandBuffer cb) {
     VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     di.memoryBarrierCount = 1;
     di.pMemoryBarriers = &m;
-    ctx.d.PipelineBarrier2(cb, &di);
+    ctx.Barrier(cb, di);
 }
 
 VkImageSubresourceLayers Layers(const Image& img, uint32_t level, uint32_t layer) {
