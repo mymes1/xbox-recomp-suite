@@ -1,11 +1,14 @@
 #include <toml++/toml.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <set>
+#include <string>
 
 #include "analysis.h"
 #include "codegen.h"
@@ -47,8 +50,9 @@ static bool ParseExit(const toml::node* n, Hook::Exit& e) {
 //     on_true/on_false make it return bool and name "ret" or an instruction of the same function to jump to
 //   [[function]] at, end  an entry decoded no further than end (exclusive); it also stops other walks
 //   [[switch]] at, targets  the targets of an indirect jmp, replacing table detection
-//   [xbe] xdk = build  includes <--xdk folder>/<build>/layout.toml and adds every name in its signatures.toml
-//     that [symbols] and [data] do not list, with address 0 (the host traps where such a name is first needed)
+//   [xbe] xdk = build  includes <--xdk folder>/<build>/layout.toml, and gives every name the host code binds
+//     (see AddHostNames) that [symbols]/[data] do not list the address 0, so an image whose symbols were never
+//     found still builds and traps where such a name is first needed
 //   [abi] name = ["esi", "stack", ...]  where a [symbols] function takes each API argument when the image does not
 //     use the convention the host declares: a register, or "stack" for the next stack slot, which the callee pops
 static bool LoadConfig(const fs::path& path, Config& cfg, const fs::path& xdk_dir) {
@@ -170,10 +174,59 @@ static bool LoadConfig(const fs::path& path, Config& cfg, const fs::path& xdk_di
     return true;
 }
 
-// Every name this XDK build's host code can bind (sdk/xdk/<build>/signatures.toml lists them all) as a symbol with
-// no address unless the config gives one. A port whose signature scan matched nothing, or only some functions,
-// still gets a placeholder for each name, so the runtime links and traps "not in this image" where the missing name
-// is first needed, instead of failing to compile inside the XDK headers.
+// The name after a binding macro on this line, if any: SYM(name), GUEST(name), GUEST_ORIG(name),
+// GUEST_CALL(name, ...), HLE_STDCALL(name, ...), HLE_FASTCALL, HLE_CDECL, HLE_WRAP and XDK_DATA(name).
+static bool BoundName(const std::string& line, size_t pos, std::string& out) {
+    while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) pos++;
+    if (pos >= line.size() || line[pos] != '(') return false;
+    for (pos++; pos < line.size() && (line[pos] == ' ' || line[pos] == '\t'); pos++) {
+    }
+    size_t start = pos;
+    if (pos >= line.size() || !(std::isalpha(uint8_t(line[pos])) || line[pos] == '_')) return false;
+    while (pos < line.size() && (std::isalnum(uint8_t(line[pos])) || line[pos] == '_')) pos++;
+    out = line.substr(start, pos - start);
+    // TOKEN_##param inside a macro that builds a name is a fragment, not a binding
+    while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) pos++;
+    return line.compare(pos, 2, "##") != 0;
+}
+
+// the code part of a line: a trailing // comment may name a macro without binding it
+static std::string_view Code(std::string_view line) { return line.substr(0, line.find("//")); }
+
+// Every name the host code in this folder binds, as the runtime sees it: the macro invocations above, since a
+// name the host replaces must be a symbol (a trapping stub when the image has no such function) and a name the
+// host reads must be data. Macro definitions name their parameters, not bindings, and are skipped.
+static void ScanHostNames(const fs::path& dir, std::set<std::string>& functions, std::set<std::string>& data) {
+    static constexpr struct {
+        const char* macro;
+        bool is_data;
+    } kBindings[] = {{"XDK_DATA", true},   {"SYM", false},         {"GUEST_CALL", false}, {"GUEST_ORIG", false},
+                     {"GUEST", false},     {"HLE_STDCALL", false}, {"HLE_FASTCALL", false}, {"HLE_CDECL", false},
+                     {"HLE_WRAP", false}};
+    std::error_code ec;
+    for (fs::recursive_directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        const fs::path& path = it->path();
+        if (!it->is_regular_file() || (path.extension() != ".cpp" && path.extension() != ".h")) continue;
+        std::ifstream f(path);
+        if (!f) continue;
+        std::string line, name;
+        bool definition = false;  // inside a macro definition, whose names are parameters, not bindings
+        while (std::getline(f, line)) {
+            size_t p = line.find_first_not_of(" \t");
+            if (p != std::string::npos && line[p] == '#') definition = true;
+            if (!definition && p != std::string::npos) {
+                std::string code{Code(line)};
+                for (auto& b : kBindings)
+                    for (size_t at = code.find(b.macro); at != std::string::npos; at = code.find(b.macro, at + 1))
+                        if (BoundName(code, at + std::strlen(b.macro), name)) (b.is_data ? data : functions).insert(name);
+            }
+            size_t last = line.find_last_not_of(" \t\r");  // the definition goes on while the line ends with a backslash
+            definition = last != std::string::npos && line[last] == '\\';
+        }
+    }
+}
+
+// The names the selected build's signature set knows, which is wider than what today's host sources read.
 static bool AddXdkNames(Config& cfg, const fs::path& xdk_dir) {
     if (!cfg.xdk || xdk_dir.empty()) return true;
     fs::path path = xdk_dir / std::to_string(cfg.xdk) / "signatures.toml";
@@ -190,6 +243,28 @@ static bool AddXdkNames(Config& cfg, const fs::path& xdk_dir) {
                             std::pair{"data", &cfg.data}})
         if (auto f = t[key].as_table())
             for (auto& [k, v] : *f) out->emplace(std::string(k.str()), 0);
+    return true;
+}
+
+// The names this image's host code binds get a symbol with no address unless the config gives one: a port whose
+// signature scan matched nothing (or only some functions, or a build with no signatures.toml at all) still gets a
+// placeholder for each, so the runtime links and traps "not in this image" where the missing name is first needed
+// instead of failing to compile inside the XDK headers. The signature set picks the classification first, then the
+// host sources add what it does not name.
+static bool AddHostNames(Config& cfg, const fs::path& xdk_dir, const fs::path& port_root) {
+    if (!AddXdkNames(cfg, xdk_dir)) return false;
+    std::set<std::string> functions, data;
+    if (!xdk_dir.empty()) {
+        fs::path runtime = xdk_dir.parent_path() / "runtime";
+        if (fs::is_directory(runtime)) ScanHostNames(runtime, functions, data);
+        else std::fprintf(stderr, "%s: no host sources, so names the runtime binds must be in the config\n",
+                          runtime.string().c_str());
+    }
+    if (!port_root.empty()) ScanHostNames(port_root / "src", functions, data);
+    for (auto& n : functions)
+        if (!cfg.data.count(n)) cfg.symbols.emplace(n, 0);
+    for (auto& n : data)
+        if (!cfg.symbols.count(n)) cfg.data.emplace(n, 0);
     return true;
 }
 
@@ -231,7 +306,10 @@ int main(int argc, char** argv) {
     }
     Config cfg;
     fs::path cfg_path = args[0];
-    if (!LoadConfig(cfg_path, cfg, xdk_dir) || !AddXdkNames(cfg, xdk_dir)) return 1;
+    // config/game.toml is the usual relative path, so the port folder is the working directory then
+    fs::path port_root = cfg_path.parent_path().parent_path();
+    if (port_root.empty()) port_root = ".";
+    if (!LoadConfig(cfg_path, cfg, xdk_dir) || !AddHostNames(cfg, xdk_dir, port_root)) return 1;
     for (auto& [name, locs] : cfg.abi)
         if (!cfg.symbols.count(name)) {
             std::fprintf(stderr, "%s: [abi] %s is not a [symbols] name\n", args[0].c_str(), name.c_str());

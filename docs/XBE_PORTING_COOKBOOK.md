@@ -20,7 +20,7 @@ The goal for each title is a reproducible local build from the owner's game file
 
 `xbe_symbols` stops with "no signatures for these library builds" when `xdk/<build>/signatures.toml` is missing. This snapshot has a 5849 signature set and layouts for 5849 plus partial 4721/4531 layouts.
 
-An unmatched build is not a build failure: the recompiler adds every name its selected `xdk/<build>/signatures.toml` knows to `[symbols]`/`[data]` with address 0, and names the shared runtime uses that no signature set has carry their own fallback. `image_symbols.h` therefore defines `SYM_`/`HAS_` for all of them, the host links, and the first call to an unresolved name stops with "not in this image" or "... is unknown for this image, add it to the config". Add proven addresses to `config/game.toml`; a build script that regenerates the config from the XBE should keep those tables, as `ports/SonicHeroes/build.sh` does.
+An unmatched build is not a build failure: the recompiler scans the host sources (the SDK runtime and the port's `src`) for the names bound through `SYM`, `GUEST`, `HLE_*` and `XDK_DATA`, adds every one the config does not give an address to as 0, and adds the names its selected `xdk/<build>/signatures.toml` knows besides. Names the runtime uses that no signature set has carry their own fallback. `image_symbols.h` therefore defines `SYM_`/`HAS_` for all of them, the host links, and the first call to an unresolved name stops with "not in this image" or "... is unknown for this image, add it to the config". Add proven addresses to `config/game.toml`; a build script that regenerates the config from the XBE should keep those tables, as `ports/SonicHeroes/build.sh` does.
 
 Use this order:
 
