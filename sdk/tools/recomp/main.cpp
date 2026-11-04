@@ -6,9 +6,11 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 
 #include "analysis.h"
 #include "codegen.h"
@@ -174,54 +176,170 @@ static bool LoadConfig(const fs::path& path, Config& cfg, const fs::path& xdk_di
     return true;
 }
 
-// The name after a binding macro on this line, if any: SYM(name), GUEST(name), GUEST_ORIG(name),
-// GUEST_CALL(name, ...), HLE_STDCALL(name, ...), HLE_FASTCALL, HLE_CDECL, HLE_WRAP and XDK_DATA(name).
-static bool BoundName(const std::string& line, size_t pos, std::string& out) {
-    while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) pos++;
-    if (pos >= line.size() || line[pos] != '(') return false;
-    for (pos++; pos < line.size() && (line[pos] == ' ' || line[pos] == '\t'); pos++) {
-    }
-    size_t start = pos;
-    if (pos >= line.size() || !(std::isalpha(uint8_t(line[pos])) || line[pos] == '_')) return false;
-    while (pos < line.size() && (std::isalnum(uint8_t(line[pos])) || line[pos] == '_')) pos++;
-    out = line.substr(start, pos - start);
-    // TOKEN_##param inside a macro that builds a name is a fragment, not a binding
-    while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) pos++;
-    return line.compare(pos, 2, "##") != 0;
-}
-
 // the code part of a line: a trailing // comment may name a macro without binding it
 static std::string_view Code(std::string_view line) { return line.substr(0, line.find("//")); }
 
-// Every name the host code in this folder binds, as the runtime sees it: the macro invocations above, since a
-// name the host replaces must be a symbol (a trapping stub when the image has no such function) and a name the
-// host reads must be data. Macro definitions name their parameters, not bindings, and are skipped.
+// A macro that binds the symbol one of its arguments names, and which argument that is: the XDK macros, such as
+// GUEST(name) and XDK_DATA(name), plus the wrappers the sources define for themselves, such as
+// CRT_MATH(name, fn), whose body is X86_FUNC(GUEST(name)).
+struct Binding {
+    std::string macro;
+    size_t arg;
+    bool is_data;
+};
+
+static std::string_view Trim(std::string_view s) {
+    size_t b = s.find_first_not_of(" \t");
+    if (b == std::string_view::npos) return {};
+    return s.substr(b, s.find_last_not_of(" \t") - b + 1);
+}
+
+static bool IsName(std::string_view s) {
+    if (s.empty() || !(std::isalpha(uint8_t(s[0])) || s[0] == '_')) return false;
+    for (char c : s)
+        if (!(std::isalnum(uint8_t(c)) || c == '_')) return false;  // TOKEN_##param is a fragment, not a name
+    return true;
+}
+
+// The k-th (0 based) argument of the call whose "(" is at pos. A call that goes on below the line still yields
+// the arguments written on it, which is all a name needs.
+static std::string_view Arg(std::string_view code, size_t pos, size_t k) {
+    if (pos >= code.size() || code[pos] != '(') return {};
+    size_t start = pos + 1, depth = 1;
+    for (size_t i = start; i < code.size(); i++) {
+        char c = code[i];
+        if (c == '(' || c == '{' || c == '[') {
+            depth++;
+        } else if (c == ')' || c == '}' || c == ']') {
+            if (--depth == 0) return k ? std::string_view{} : Trim(code.substr(start, i - start));
+        } else if (c == ',' && depth == 1) {
+            if (!k) return Trim(code.substr(start, i - start));
+            k--;
+            start = i + 1;
+        }
+    }
+    return k ? std::string_view{} : Trim(code.substr(start));
+}
+
+// f(binding, position of its "(") for each call of a binding macro in the code
+template <typename F>
+static void Calls(std::string_view code, const Binding& b, F f) {
+    for (size_t at = code.find(b.macro); at != std::string_view::npos; at = code.find(b.macro, at + 1)) {
+        if (at && (std::isalnum(uint8_t(code[at - 1])) || code[at - 1] == '_')) continue;  // CUSTOM_SYM( is not SYM(
+        size_t p = at + b.macro.size();
+        while (p < code.size() && (code[p] == ' ' || code[p] == '\t')) p++;
+        if (p < code.size() && code[p] == '(') f(b, p);
+    }
+}
+
+template <typename F>
+static void Calls(std::string_view code, const std::vector<Binding>& bindings, F f) {
+    for (auto& b : bindings) Calls(code, b, f);
+}
+
+// true when the code applies this binding macro to exactly this name
+static bool Binds(std::string_view code, const Binding& b, std::string_view name) {
+    bool binds = false;
+    Calls(code, b, [&](const Binding& b, size_t pos) { binds |= Arg(code, pos, b.arg) == name; });
+    return binds;
+}
+
+static bool Has(const std::vector<Binding>& bindings, std::string_view macro) {
+    for (auto& b : bindings)
+        if (b.macro == macro) return true;
+    return false;
+}
+
+// The wrappers a file defines: when a definition's body applies a known binding macro to one of its parameters,
+// each call binds whatever name that parameter takes there. One round adds CRT_MATH from GUEST, the next adds a
+// wrapper of CRT_MATH.
+static void AddForwards(std::string_view text, std::vector<Binding>& bindings) {
+    size_t at = 0;
+    while (at < text.size()) {
+        size_t eol = text.find('\n', at);
+        if (eol == std::string_view::npos) eol = text.size();
+        std::string_view head = Trim(text.substr(at, eol - at));
+        at = eol + 1;
+        if (head.substr(0, 7) != "#define") continue;
+        std::string def{head};
+        for (size_t end = eol; end < text.size();) {  // the definition goes on while the line ends with a backslash
+            size_t b = def.find_last_not_of(" \r");
+            if (b == std::string::npos || def[b] != '\\') break;
+            size_t next = text.find('\n', end + 1);
+            if (next == std::string_view::npos) next = text.size();
+            def.resize(b);
+            def += ' ';
+            def += text.substr(end + 1, next - end - 1);
+            end = next;
+        }
+        size_t name_b = def.find_first_not_of(" \t", 7);
+        if (name_b == std::string::npos) continue;
+        size_t name_e = name_b;
+        while (name_e < def.size() && (std::isalnum(uint8_t(def[name_e])) || def[name_e] == '_')) name_e++;
+        std::string macro = def.substr(name_b, name_e - name_b);
+        if (name_e >= def.size() || def[name_e] != '(' || Has(bindings, macro)) continue;
+        size_t close = name_e;  // the end of the parameter list
+        for (size_t depth = 0; close < def.size(); close++) {
+            if (def[close] == '(') depth++;
+            else if (def[close] == ')' && !--depth) break;
+        }
+        if (close >= def.size()) continue;
+        std::string_view body = std::string_view(def).substr(close + 1);
+        std::vector<std::string_view> params;
+        size_t start = name_e + 1;
+        for (size_t i = start; i <= close; i++) {
+            if (i == close || def[i] == ',') {
+                params.push_back(Trim(std::string_view(def).substr(start, i - start)));
+                start = i + 1;
+            }
+        }
+        size_t found = bindings.size();
+        for (size_t i = 0; i < params.size(); i++) {
+            if (!IsName(params[i])) continue;
+            for (size_t k = 0; k < found; k++)
+                if (Binds(body, bindings[k], params[i])) bindings.push_back({macro, i, bindings[k].is_data});
+        }
+    }
+}
+
+// Every name the host code in this folder binds, as the runtime sees it: a name the host replaces must be a
+// symbol (a trapping stub when the image has no such function) and a name the host reads must be data. Macro
+// definitions name their parameters, not bindings, and are only read for the wrappers they declare.
 static void ScanHostNames(const fs::path& dir, std::set<std::string>& functions, std::set<std::string>& data) {
-    static constexpr struct {
-        const char* macro;
-        bool is_data;
-    } kBindings[] = {{"XDK_DATA", true},   {"SYM", false},         {"GUEST_CALL", false}, {"GUEST_ORIG", false},
-                     {"GUEST", false},     {"HLE_STDCALL", false}, {"HLE_FASTCALL", false}, {"HLE_CDECL", false},
-                     {"HLE_WRAP", false}};
+    std::vector<Binding> bindings{{"XDK_DATA", 0, true},      {"SYM", 0, false},         {"GUEST_CALL", 0, false},
+                                  {"GUEST_ORIG", 0, false},   {"GUEST", 0, false},       {"HLE_STDCALL", 0, false},
+                                  {"HLE_FASTCALL", 0, false}, {"HLE_CDECL", 0, false},   {"HLE_WRAP", 0, false}};
+    std::vector<std::string> sources;
     std::error_code ec;
     for (fs::recursive_directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
         const fs::path& path = it->path();
         if (!it->is_regular_file() || (path.extension() != ".cpp" && path.extension() != ".h")) continue;
         std::ifstream f(path);
         if (!f) continue;
-        std::string line, name;
+        std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        sources.push_back(std::move(text));
+    }
+    for (int round = 0; round < 3; round++)  // a wrapper of a wrapper needs the round after the one that added it
+        for (auto& text : sources) AddForwards(text, bindings);
+
+    for (auto& text : sources) {
         bool definition = false;  // inside a macro definition, whose names are parameters, not bindings
-        while (std::getline(f, line)) {
+        for (size_t at = 0; at < text.size();) {
+            size_t eol = text.find('\n', at);
+            if (eol == std::string::npos) eol = text.size();
+            std::string_view line = std::string_view(text).substr(at, eol - at);
+            at = eol + 1;
             size_t p = line.find_first_not_of(" \t");
-            if (p != std::string::npos && line[p] == '#') definition = true;
-            if (!definition && p != std::string::npos) {
-                std::string code{Code(line)};
-                for (auto& b : kBindings)
-                    for (size_t at = code.find(b.macro); at != std::string::npos; at = code.find(b.macro, at + 1))
-                        if (BoundName(code, at + std::strlen(b.macro), name)) (b.is_data ? data : functions).insert(name);
+            if (p != std::string_view::npos && line[p] == '#') definition = true;
+            if (!definition && p != std::string_view::npos) {
+                std::string_view code = Code(line);
+                Calls(code, bindings, [&](const Binding& b, size_t pos) {
+                    std::string_view name = Arg(code, pos, b.arg);
+                    if (IsName(name)) (b.is_data ? data : functions).emplace(name);
+                });
             }
             size_t last = line.find_last_not_of(" \t\r");  // the definition goes on while the line ends with a backslash
-            definition = last != std::string::npos && line[last] == '\\';
+            definition = last != std::string_view::npos && line[last] == '\\';
         }
     }
 }

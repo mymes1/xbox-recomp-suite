@@ -14,6 +14,10 @@ namespace kernel {
 
 extern const xbe::Image* g_image;
 
+// The Dispatch/QueueDpc pair in objects.cpp reads the gate, so this definition has external linkage: inside the
+// anonymous namespace below it would be internal and the reference would not resolve at link time.
+IrqlGate g_irql_gate;
+
 namespace {
 
 KERNEL_DATA(156, KeTickCount, 4);
@@ -58,7 +62,6 @@ void PutAnsi(uint32_t str, const char* text) {
 }
 
 uint8_t& Irql() { return G<uint8_t>(Current()->kpcr + 0x24); }
-IrqlGate g_irql_gate;
 
 int64_t TimeoutArg(uint32_t ptr) { return ptr ? int64_t(R64(ptr)) : INT64_MAX; }
 
